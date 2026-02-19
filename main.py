@@ -3116,8 +3116,8 @@ async def chat_gift(message: types.Message):
     if not await is_chat_confirmed if await is_banned(user_id):
         return
     if not await is_chat_confirmed(chat_id):
-        await message.reply("❌ Этот чат ещё(chat_id):
-        await message.reply("❌ Этот чат ещё не ак не активирован. Ожидайте подтверждения администраторативирован. Ожидайте подтверждения администратора.")
+        await message.reply(f"❌ Этот чат ещё не активирован. ID чата: {chat_id}")
+        await message.reply("❌ Этот чат ещё не активирован. Ожидайте подтверждения администратора.")
         return
 
     gift_amount = int(await get_setting("gift_amount"))
