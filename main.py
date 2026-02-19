@@ -3121,13 +3121,7 @@ async def chat_gift(message: types.Message):
             await conn.execute("UPDATE confirmed_chats SET last_gift_date=$1, gift_count_today=1 WHERE chat_id=$2", today, chat_id)
 
         if user['last_gift_time'] and user['last_gift_time'].startswith(today):
-            await conn.execute("UPDATE users SET gift_count_today = gift_count_today + 1, last_gift_time=$1 WHERE user_id=$2",
-                               now.strftime("%Y-%m-%d %H:%M:%S"), user_id)
-        else:
-            await conn.execute("UPDATE users SET gift_count_today=1, last_gift_time=$1 WHERE user_id=$2",
-                               now.strftime("%Y-%m-%d %H:%M:%S"), user_id)
-
-    await message.answer(
+                await message.answer(
         f"🎁 {message.from_user.first_name} активировал подгон!\n"
         f"Счастливчик: {recipient.first_name} получает {gift_amount} монет! 🎉\n"
         f"📊 Сегодня в этом чате осталось подгонов: {gift_limit_per_chat - (gift_count_today + 1)}"
