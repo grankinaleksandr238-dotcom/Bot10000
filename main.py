@@ -2784,7 +2784,7 @@ async def check_chat(message: types.Message) -> bool:
     return True
 
 # ==================== КОМАНДА FIGHT ====================
-@dp.message_handler(Command("fight"))
+@dp.message_handler(commands=['fight'])
 async def cmd_fight(message: types.Message):
     if not await check_chat(message):
         return
