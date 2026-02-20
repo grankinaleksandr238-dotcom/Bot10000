@@ -7025,7 +7025,7 @@ async def smuggle_check_loop():
                     else:
                         await safe_send_message(user_id, notify_text)
         except Exception as e:
-            logging.error(f"Smuggle check error: {e}")
+            logging.error(f"Smuggle check loop error: {e}")
 
 # ==================== ВЕБ-СЕРВЕР ====================
 async def handle(request):
