@@ -6870,6 +6870,88 @@ async def ad_sender_loop():
                         chat_ids = list(chats.keys())
                         if chat_ids:
                             chat_id = random.choice(chat_ids)
+                            # ==================== ЧАСТЬ 9: ФОНОВЫЕ ЗАДАЧИ, ВЕБ-СЕРВЕР, ТОЧКА ВХОДА ====================
+
+# ==================== ФУНКЦИИ ОЧИСТКИ ====================
+async def perform_cleanup(manual=False):
+    """Удаляет старые записи согласно настройкам."""
+    days_bosses = int(await get_setting("cleanup_days_bosses"))
+    days_auctions = int(await get_setting("cleanup_days_auctions"))
+    days_purchases = int(await get_setting("cleanup_days_purchases"))
+    days_giveaways = int(await get_setting("cleanup_days_giveaways"))
+    days_tasks = int(await get_setting("cleanup_days_user_tasks"))
+    days_fight = int(await get_setting("cleanup_days_fight_logs"))
+    days_smuggle = int(await get_setting("cleanup_days_smuggle"))
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM bosses WHERE status IN ('defeated', 'expired') AND spawned_at < NOW() - INTERVAL '1 day' * $1", days_bosses)
+        await conn.execute("DELETE FROM boss_attacks WHERE attack_time < NOW() - INTERVAL '1 day' * $1", days_bosses)
+        await conn.execute("DELETE FROM auctions WHERE status='ended' AND end_time < NOW() - INTERVAL '1 day' * $1", days_auctions)
+        await conn.execute("DELETE FROM purchases WHERE status IN ('completed','rejected') AND purchase_date < NOW() - INTERVAL '1 day' * $1", days_purchases)
+        await conn.execute("DELETE FROM giveaways WHERE status='completed' AND end_date < NOW() - INTERVAL '1 day' * $1", days_giveaways)
+        await conn.execute("DELETE FROM user_tasks WHERE expires_at IS NOT NULL AND expires_at < NOW()")
+        await conn.execute("DELETE FROM fight_logs WHERE timestamp < NOW() - INTERVAL '1 day' * $1", days_fight)
+        cooldown = int(await get_setting("fight_cooldown_minutes"))
+        await conn.execute("DELETE FROM global_cooldowns WHERE last_used < NOW() - INTERVAL '1 minute' * $1", cooldown * 2)
+        await conn.execute("DELETE FROM authority_offers WHERE status IN ('sold', 'cancelled')")
+        await conn.execute("DELETE FROM authority_offers WHERE status='active' AND created_at < NOW() - INTERVAL '30 days'")
+        await conn.execute("DELETE FROM smuggle_runs WHERE status IN ('completed', 'failed') AND end_time < NOW() - INTERVAL '1 day' * $1", days_smuggle)
+        
+    if manual:
+        logging.info("Ручная очистка выполнена.")
+    else:
+        logging.info("Автоматическая очистка логов выполнена.")
+
+# ==================== ФОНОВЫЕ ЗАДАЧИ ====================
+async def boss_spawn_loop():
+    while True:
+        await asyncio.sleep(300)  # каждые 5 минут
+        try:
+            confirmed = await get_confirmed_chats()
+            now = datetime.now()
+            for chat_id, data in confirmed.items():
+                boss_max_per_day = int(await get_setting("boss_max_per_day"))
+                boss_spawn_count = data.get('boss_spawn_count', 0)
+                if boss_spawn_count >= boss_max_per_day:
+                    continue
+                last_spawn_str = data.get('boss_last_spawn')
+                if last_spawn_str:
+                    last_spawn = last_spawn_str
+                    min_interval = int(await get_setting("boss_min_interval"))
+                    if (now - last_spawn).total_seconds() < min_interval * 60:
+                        continue
+                chance = int(await get_setting("boss_spawn_chance"))
+                if random.randint(1, 100) <= chance:
+                    await spawn_boss(chat_id)
+        except Exception as e:
+            logging.error(f"Boss spawn loop error: {e}")
+
+async def cleanup_loop():
+    while True:
+        await asyncio.sleep(86400)  # раз в сутки
+        try:
+            await perform_cleanup(manual=False)
+        except Exception as e:
+            logging.error(f"Cleanup loop error: {e}")
+
+async def ad_sender_loop():
+    while True:
+        await asyncio.sleep(60)  # каждую минуту
+        try:
+            if db_pool is None:
+                continue
+            async with db_pool.acquire() as conn:
+                ads = await conn.fetch("SELECT * FROM ads WHERE enabled=TRUE")
+                now = datetime.now()
+                for ad in ads:
+                    last_sent = ad['last_sent']
+                    if last_sent and (now - last_sent).total_seconds() < ad['interval_minutes'] * 60:
+                        continue
+                    if ad['target'] in ('chats', 'all'):
+                        chats = await get_confirmed_chats()
+                        chat_ids = list(chats.keys())
+                        if chat_ids:
+                            chat_id = random.choice(chat_ids)
                             await safe_send_chat(chat_id, ad['text'])
                     if ad['target'] in ('private', 'all'):
                         users = await conn.fetch("SELECT user_id FROM users WHERE user_id NOT IN (SELECT user_id FROM admins) ORDER BY RANDOM() LIMIT 1")
@@ -6965,6 +7047,25 @@ async def on_startup(dp):
     await create_db_pool()
     await init_db()
     await init_business_types()
+    
+    # ========== ПРИНУДИТЕЛЬНОЕ ДОБАВЛЕНИЕ НЕДОСТАЮЩИХ КОЛОНОК ==========
+    async with db_pool.acquire() as conn:
+        # Для таблицы users
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS smuggle_goods INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS smuggle_success INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS smuggle_fail INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS global_authority INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS multiplayer_wins INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS multiplayer_losses INTEGER DEFAULT 0")
+        # Для таблицы bosses
+        await conn.execute("ALTER TABLE bosses ADD COLUMN IF NOT EXISTS image_file_id TEXT")
+        await conn.execute("ALTER TABLE bosses ADD COLUMN IF NOT EXISTS description TEXT")
+        # Для таблицы smuggle_runs
+        await conn.execute("ALTER TABLE smuggle_runs ADD COLUMN IF NOT EXISTS chat_id BIGINT")
+        # Для таблицы confirmed_chats (auto_delete_enabled может отсутствовать)
+        await conn.execute("ALTER TABLE confirmed_chats ADD COLUMN IF NOT EXISTS auto_delete_enabled BOOLEAN DEFAULT TRUE")
+        logging.info("✅ Принудительное обновление таблиц выполнено")
+    
     await asyncio.sleep(2)
     asyncio.create_task(boss_spawn_loop())
     asyncio.create_task(cleanup_loop())
