@@ -8024,7 +8024,7 @@ async def room_chat_message room_chat_message(message: types.Message(message: ty
     async with db_p    user_id = message.from_user.id
     async with db_pool.acquire() as connool.acquire() as conn:
         players =:
-        players = await conn.fetch("SELECT user_id FROM game_players WHERE await conn.fetch("SELECT user_id FROM game_players WHERE game_id=$1", game_id)
+        players = await conn.fetch("SELECT user_id FROM game_players WHERE game_id=$1", game_id)
  game_id=$1", game_id)
     for p in players:
         if p['    for p in players:
