@@ -1839,15 +1839,36 @@ async def roulette_spin(bet_type: str, bet_number: int = None) -> Tuple[int, str
 
 # ==================== ФУНКЦИИ ДЛЯ КОНТРАБАНДЫ ====================
 
+async def check_smuggle_cooldown(user_id: int) -> Tuple[bool, int]:
+    """
+    Проверяет, может ли пользователь отправиться в новый рейс.
+    Возвращает (можно ли, сколько секунд осталось).
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT cooldown_until FROM smuggle_cooldowns WHERE user_id=$1", user_id)
+        if row and row['cooldown_until']:
+            if isinstance(row['cooldown_until'], str):
+                cooldown_until = datetime.strptime(row['cooldown_until'], "%Y-%m-%d %H:%M:%S")
+            else:
+                cooldown_until = row['cooldown_until']
+            
+            remaining = (cooldown_until - datetime.now()).total_seconds()
+            if remaining > 0:
+                return False, int(remaining)
+    return True, 0
+
 async def set_smuggle_cooldown(user_id: int, penalty: int = 0):
-    cooldown = int(await get_setting("smuggle_cooldown_minutes")) + penalty
-    cooldown_time = datetime.now() + timedelta(minutes=cooldown)
+    """
+    Устанавливает кулдаун для команды smuggle с учётом штрафа.
+    """
+    base = int(await get_setting("smuggle_cooldown_minutes"))
+    cooldown_until = datetime.now() + timedelta(minutes=base + penalty)
     async with db_pool.acquire() as conn:
         await conn.execute('''
-            INSERT INTO global_cooldowns (user_id, command, last_used)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, command) DO UPDATE SET last_used = $3
-        ''', user_id, "smuggle", cooldown_time)
+            INSERT INTO smuggle_cooldowns (user_id, cooldown_until)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET cooldown_until = $2
+        ''', user_id, cooldown_until.strftime("%Y-%m-%d %H:%M:%S"))
 
 # ==================== ФУНКЦИИ ДЛЯ МУЛЬТИПЛЕЕРА ====================
 
