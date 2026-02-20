@@ -4204,3 +4204,562 @@ async def back_from_submenu(message: types.Message):
 async def unknown_command_private(message: types.Message):
     if message.chat.type == 'private':
         await message.answer("❌ Неизвестная команда. Введи /help для списка доступных.")
+# ==================== ПОЛНЫЙ РАБОЧИЙ БОТ ====================
+# Часть 4: Групповые хендлеры, боссы, подтверждение чатов, автоудаление, команда /boss_status
+
+# ==================== ГРУППОВЫЕ ЧАТЫ ====================
+async def check_chat(message: types.Message) -> bool:
+    """Проверяет, что сообщение из группы и чат активирован."""
+    if message.chat.type == 'private':
+        await auto_delete_reply(message, "❌ Эта команда работает только в группах.")
+        return False
+    if not await is_chat_confirmed(message.chat.id):
+        await auto_delete_reply(message, "❌ Этот чат не активирован. Обратитесь к администратору.")
+        return False
+    return True
+
+# ==================== КОМАНДА FIGHT (с глобальным кулдауном) ====================
+@dp.message_handler(commands=['fight'])
+async def cmd_fight(message: types.Message):
+    if not await check_chat(message):
+        return
+    
+    # Проверка на бан
+    if await is_banned(message.from_user.id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    
+    await auto_delete_message(message)
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    username = message.from_user.first_name
+
+    # Проверяем глобальный кулдаун для команды fight (общий для всех чатов)
+    cooldown_minutes = int(await get_setting("fight_cooldown_minutes"))
+    ok, remaining = await check_global_cooldown(user_id, "fight", cooldown_minutes)
+    if not ok:
+        await auto_delete_reply(
+            message,
+            f"⏳ Ты слишком часто машешь кулаками! Подожди ещё {format_time_remaining(remaining)}."
+        )
+        return
+
+    stats = await get_user_stats(user_id)
+    strength = stats['strength']
+    agility = stats['agility']
+    defense = stats['defense']
+
+    damage = await calculate_fight_damage(strength)
+    authority = await calculate_fight_authority()
+
+    outcome = "hit"
+    counter_damage = 0
+
+    if is_critical(strength, agility):
+        damage = int(damage * 1.5)
+        authority = int(authority * 1.5)
+        phrase_list = FIGHT_CRIT_PHRASES
+        outcome = "crit"
+    else:
+        phrase_list = FIGHT_HIT_PHRASES
+
+    if is_counter(defense):
+        counter_damage = random.randint(1, 5)
+        await update_user_balance(user_id, -counter_damage)
+        outcome = "counter"
+        phrase_list = FIGHT_COUNTER_PHRASES
+
+    # Добавляем авторитет в текущем чате
+    await add_chat_authority(chat_id, user_id, authority, damage)
+    # Добавляем в общий авторитет пользователя (глобальный)
+    await update_user_global_authority(user_id, authority)
+
+    await log_fight(chat_id, user_id, damage, authority, outcome)
+    # Устанавливаем глобальный кулдаун
+    await set_global_cooldown(user_id, "fight")
+
+    if outcome == "counter":
+        phrase = get_random_phrase(phrase_list, damage=counter_damage)
+    else:
+        phrase = get_random_phrase(phrase_list, damage=damage, authority=authority)
+
+    await auto_delete_reply(
+        message,
+        f"{username}, {phrase}\n"
+        f"Твой авторитет в этом чате: {await get_chat_authority(chat_id, user_id)}\n"
+        f"Общий авторитет: {await get_user_global_authority(user_id)}"
+    )
+
+    if outcome == "counter":
+        await auto_delete_reply(message, f"💸 Ты потерял {counter_damage} баксов.")
+
+# ==================== КОМАНДА GYM ====================
+@dp.message_handler(commands=['gym'])
+async def cmd_gym(message: types.Message):
+    if not await check_chat(message):
+        return
+    
+    if await is_banned(message.from_user.id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    
+    await auto_delete_message(message)
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    # Используем авторитет именно в этом чате
+    authority = await get_chat_authority(chat_id, user_id)
+
+    strength_cost = int(await get_setting("gym_strength_cost"))
+    agility_cost = int(await get_setting("gym_agility_cost"))
+    defense_cost = int(await get_setting("gym_defense_cost"))
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(f"💪 Сила ({strength_cost} авт.)", callback_data="gym_strength"),
+        types.InlineKeyboardButton(f"🏃 Ловкость ({agility_cost} авт.)", callback_data="gym_agility"),
+        types.InlineKeyboardButton(f"🛡 Защита ({defense_cost} авт.)", callback_data="gym_defense"),
+        types.InlineKeyboardButton("❌ Отмена", callback_data="gym_cancel")
+    )
+
+    await auto_delete_reply(
+        message,
+        f"🏋️ Качалка! У тебя {authority} авторитета в этом чате.\n"
+        f"Что хочешь улучшить?",
+        reply_markup=kb
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith("gym_"))
+async def gym_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    if not await is_chat_confirmed(chat_id):
+        await callback.answer("Чат не активирован.", show_alert=True)
+        return
+
+    action = callback.data.split("_")[1]
+
+    if action == "cancel":
+        await callback.message.delete()
+        await callback.answer()
+        return
+
+    if action == "strength":
+        cost = int(await get_setting("gym_strength_cost"))
+        stat = "strength"
+    elif action == "agility":
+        cost = int(await get_setting("gym_agility_cost"))
+        stat = "agility"
+    elif action == "defense":
+        cost = int(await get_setting("gym_defense_cost"))
+        stat = "defense"
+    else:
+        await callback.answer("Неизвестная опция")
+        return
+
+    authority = await get_chat_authority(chat_id, user_id)
+    if authority < cost:
+        await callback.answer(f"❌ Не хватает авторитета. Нужно {cost}, у тебя {authority}.", show_alert=True)
+        return
+
+    if await spend_chat_authority(chat_id, user_id, cost):
+        if stat == "strength":
+            await update_user_stats(user_id, strength_delta=1)
+        elif stat == "agility":
+            await update_user_stats(user_id, agility_delta=1)
+        elif stat == "defense":
+            await update_user_stats(user_id, defense_delta=1)
+
+        await callback.answer(f"✅ Ты улучшил {stat}!", show_alert=True)
+        await callback.message.edit_text(
+            f"✅ Ты улучшил {stat}!\n"
+            f"Осталось авторитета в этом чате: {await get_chat_authority(chat_id, user_id)}"
+        )
+    else:
+        await callback.answer("❌ Ошибка при списании авторитета.", show_alert=True)
+
+# ==================== КОМАНДА STATUS ====================
+@dp.message_handler(commands=['status'])
+async def cmd_status(message: types.Message):
+    if not await check_chat(message):
+        return
+    
+    if await is_banned(message.from_user.id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    
+    await auto_delete_message(message)
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    stats = await get_user_stats(user_id)
+    chat_auth = await get_chat_authority(chat_id, user_id)
+    global_auth = await get_user_global_authority(user_id)
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT fights, total_damage FROM chat_authority WHERE chat_id=$1 AND user_id=$2",
+            chat_id, user_id
+        )
+    fights = row['fights'] if row else 0
+    total_damage = row['total_damage'] if row else 0
+
+    text = (
+        f"📊 Твой статус в этом чате:\n"
+        f"Авторитет (в чате): {chat_auth}\n"
+        f"Авторитет (общий): {global_auth}\n"
+        f"💪 Сила: {stats['strength']}\n"
+        f"🏃 Ловкость: {stats['agility']}\n"
+        f"🛡 Защита: {stats['defense']}\n"
+        f"⚔️ Боёв: {fights}\n"
+        f"💥 Общий урон: {total_damage}"
+    )
+    await auto_delete_reply(message, text)
+
+# ==================== КОМАНДА TOP ====================
+@dp.message_handler(commands=['top'])
+async def cmd_top(message: types.Message):
+    if not await check_chat(message):
+        return
+    
+    if await is_banned(message.from_user.id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    
+    await auto_delete_message(message)
+
+    chat_id = message.chat.id
+    page = 1
+    args = message.get_args().split()
+    if args and args[0].isdigit():
+        page = int(args[0])
+
+    await show_chat_top(chat_id, message, page)
+
+async def show_chat_top(chat_id: int, message: types.Message, page: int = 1, order: str = "authority"):
+    offset = (page - 1) * 10
+    async with db_pool.acquire() as conn:
+        if order == "authority":
+            rows = await conn.fetch(
+                "SELECT user_id, authority, total_damage, fights FROM chat_authority WHERE chat_id=$1 ORDER BY authority DESC LIMIT 10 OFFSET $2",
+                chat_id, offset
+            )
+        elif order == "damage":
+            rows = await conn.fetch(
+                "SELECT user_id, authority, total_damage, fights FROM chat_authority WHERE chat_id=$1 ORDER BY total_damage DESC LIMIT 10 OFFSET $2",
+                chat_id, offset
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT user_id, authority, total_damage, fights FROM chat_authority WHERE chat_id=$1 ORDER BY fights DESC LIMIT 10 OFFSET $2",
+                chat_id, offset
+            )
+        total = await conn.fetchval("SELECT COUNT(*) FROM chat_authority WHERE chat_id=$1", chat_id)
+
+    if not rows:
+        await auto_delete_reply(message, "🏆 В этом чате пока нет участников.")
+        return
+
+    text = f"🏆 Топ чата (по {order}):\n"
+    for i, row in enumerate(rows, start=offset+1):
+        try:
+            member = await bot.get_chat_member(chat_id, row['user_id'])
+            name = member.user.first_name
+        except:
+            name = f"ID {row['user_id']}"
+        text += f"{i}. {name} – Авторитет: {row['authority']}, Урон: {row['total_damage']}, Боёв: {row['fights']}\n"
+
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    nav = []
+    if page > 1:
+        nav.append(types.InlineKeyboardButton("⬅️", callback_data=f"chat_top_page_{order}_{page-1}"))
+    nav.append(types.InlineKeyboardButton(f"{page}", callback_data="noop"))
+    if offset + 10 < total:
+        nav.append(types.InlineKeyboardButton("➡️", callback_data=f"chat_top_page_{order}_{page+1}"))
+    kb.row(*nav)
+
+    kb.row(
+        types.InlineKeyboardButton("📊 По авторитету", callback_data=f"chat_top_authority_1"),
+        types.InlineKeyboardButton("💥 По урону", callback_data=f"chat_top_damage_1"),
+        types.InlineKeyboardButton("⚔️ По боям", callback_data=f"chat_top_fights_1")
+    )
+
+    await auto_delete_reply(message, text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("chat_top_"))
+async def chat_top_callback(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) < 4:
+        await callback.answer()
+        return
+    order = parts[2]
+    page = int(parts[3])
+    chat_id = callback.message.chat.id
+    await show_chat_top(chat_id, callback.message, page, order)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "noop")
+async def noop(callback: types.CallbackQuery):
+    await callback.answer()
+
+# ==================== КОМАНДА HELP В ЧАТЕ ====================
+@dp.message_handler(commands=['help'])
+async def cmd_help_chat(message: types.Message):
+    if not await check_chat(message):
+        return
+    
+    if await is_banned(message.from_user.id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    
+    await auto_delete_message(message)
+    text = (
+        "📚 Доступные команды в этом чате:\n"
+        "/fight – атаковать банду (раз в 30 мин, общий кулдаун)\n"
+        "/gym – улучшить характеристики за авторитет\n"
+        "/status – твой статус\n"
+        "/top – топ чата\n"
+        "/boss_status – текущее HP босса\n"
+        "/help – это сообщение"
+    )
+    await auto_delete_reply(message, text)
+
+# ==================== КОМАНДА BOSS_STATUS ====================
+@dp.message_handler(commands=['boss_status'])
+async def cmd_boss_status(message: types.Message):
+    if not await check_chat(message):
+        return
+    
+    if await is_banned(message.from_user.id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    
+    await auto_delete_message(message)
+
+    chat_id = message.chat.id
+    async with db_pool.acquire() as conn:
+        boss = await conn.fetchrow(
+            "SELECT * FROM bosses WHERE chat_id=$1 AND status='active'",
+            chat_id
+        )
+    if not boss:
+        await auto_delete_reply(message, "❌ В этом чате нет активного босса.")
+        return
+
+    # Прогресс-бар HP
+    bar_length = 10
+    filled = int((boss['max_hp'] - boss['hp']) / boss['max_hp'] * bar_length) if boss['max_hp'] > 0 else 0
+    bar = "🟥" * filled + "⬜" * (bar_length - filled)
+
+    text = (
+        f"👾 <b>{boss['name']}</b> (Уровень {boss['level']})\n"
+        f"HP: {boss['hp']}/{boss['max_hp']}\n"
+        f"{bar}\n"
+        f"Награда: {boss['reward_coins']} баксов"
+    )
+    if boss['image_file_id']:
+        await bot.send_photo(chat_id, boss['image_file_id'], caption=text)
+    else:
+        await safe_send_chat(chat_id, text)
+
+# ==================== ПОДГОН (GIFT) ====================
+@dp.message_handler(lambda message: message.chat.type != 'private' and message.text == "🎁 Подгон")
+async def chat_gift(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if await is_banned(user_id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    if not await is_chat_confirmed(chat_id):
+        await auto_delete_reply(message, "❌ Этот чат ещё не активирован. Ожидайте подтверждения администратора.")
+        return
+
+    gift_amount = int(await get_setting("gift_amount"))
+    gift_limit_per_chat = int(await get_setting("gift_limit_per_day"))
+    gift_global_limit = int(await get_setting("gift_global_limit_per_user"))
+    gift_cooldown = int(await get_setting("gift_cooldown"))
+    today = date.today().isoformat()
+    now = datetime.now()
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            chat_info = await conn.fetchrow("SELECT * FROM confirmed_chats WHERE chat_id=$1", chat_id)
+            if not chat_info:
+                return
+            last_gift_date = chat_info['last_gift_date']
+            gift_count_today = chat_info['gift_count_today'] if last_gift_date == today else 0
+
+            if gift_count_today >= gift_limit_per_chat:
+                await auto_delete_reply(message, f"❌ Сегодня в этом чате уже использовано {gift_count_today} из {gift_limit_per_chat} подгонов.")
+                return
+
+            user = await conn.fetchrow("SELECT last_gift_time, gift_count_today FROM users WHERE user_id=$1", user_id)
+            if not user:
+                await conn.execute(
+                    "INSERT INTO users (user_id, username, first_name, joined_date) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    user_id, message.from_user.username, message.from_user.first_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+                user = {'last_gift_time': None, 'gift_count_today': 0}
+            if user['last_gift_time'] and user['last_gift_time'].startswith(today):
+                user_gift_count = user['gift_count_today']
+            else:
+                user_gift_count = 0
+
+            if user_gift_count >= gift_global_limit:
+                await auto_delete_reply(message, f"❌ Сегодня ты уже получил {user_gift_count} из {gift_global_limit} подгонов во всех чатах.")
+                return
+
+            if user['last_gift_time']:
+                last_gift = datetime.strptime(user['last_gift_time'], "%Y-%m-%d %H:%M:%S")
+                diff = (now - last_gift).total_seconds() / 60
+                if diff < gift_cooldown:
+                    remaining = int(gift_cooldown - diff)
+                    await auto_delete_reply(message, f"⏳ Подгон можно будет использовать через {remaining} мин.")
+                    return
+
+            try:
+                admins = await bot.get_chat_administrators(chat_id)
+                eligible = [a.user for a in admins if a.user.id != user_id and a.user.id != (await bot.me).id and not await is_banned(a.user.id)]
+                if not eligible:
+                    await auto_delete_reply(message, "❌ Нет подходящих получателей для подарка.")
+                    return
+                recipient = random.choice(eligible)
+            except Exception as e:
+                logging.error(f"Gift error: {e}")
+                await auto_delete_reply(message, "❌ Не удалось выбрать получателя.")
+                return
+
+            await conn.execute(
+                "INSERT INTO users (user_id, username, first_name, joined_date) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                recipient.id, recipient.username, recipient.first_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+
+            await update_user_balance(recipient.id, gift_amount, conn=conn)
+
+            if last_gift_date == today:
+                await conn.execute("UPDATE confirmed_chats SET gift_count_today = gift_count_today + 1 WHERE chat_id=$1", chat_id)
+            else:
+                await conn.execute("UPDATE confirmed_chats SET last_gift_date=$1, gift_count_today=1 WHERE chat_id=$2", today, chat_id)
+
+            new_user_gift_count = user_gift_count + 1
+            await conn.execute(
+                "UPDATE users SET last_gift_time=$1, gift_count_today=$2 WHERE user_id=$3",
+                now.strftime("%Y-%m-%d %H:%M:%S"), new_user_gift_count, user_id
+            )
+
+            remaining_chat = gift_limit_per_chat - (gift_count_today + 1)
+            # Это сообщение не удаляем, оно важное
+            await message.reply(
+                f"🎁 {message.from_user.first_name} активировал подгон!\n"
+                f"Счастливчик: {recipient.first_name} получает {gift_amount} баксов! 🎉\n"
+                f"📊 Сегодня в этом чате осталось подгонов: {remaining_chat}"
+            )
+
+# ==================== ОБРАБОТЧИК ДОБАВЛЕНИЯ БОТА В ЧАТ ====================
+@dp.message_handler(content_types=['new_chat_members'])
+async def bot_added_to_chat(message: types.Message):
+    bot_user = await bot.me
+    if bot_user.id not in [user.id for user in message.new_chat_members]:
+        return
+    chat = message.chat
+    user_id = message.from_user.id
+    await create_chat_confirmation_request(chat.id, chat.title, chat.type, user_id)
+
+    try:
+        chat_info = await bot.get_chat(chat.id)
+        invite_link = chat_info.invite_link
+    except:
+        invite_link = None
+
+    for admin_id in SUPER_ADMINS:
+        kb = confirm_chat_inline(chat.id)
+        text = (
+            f"🆕 Запрос на активацию бота в чате:\n"
+            f"Название: {chat.title}\n"
+            f"ID: {chat.id}\n"
+            f"Тип: {chat.type}\n"
+        )
+        if invite_link:
+            text += f"Ссылка: {invite_link}\n"
+        text += f"Запросил: {message.from_user.first_name} (ID: {user_id})"
+        await safe_send_message(admin_id, text, reply_markup=kb)
+    await message.answer("📋 Запрос на активацию бота отправлен администратору. Ожидайте подтверждения.")
+
+# ==================== ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ (ДЛЯ АТАКИ БОССА) ====================
+@dp.message_handler(lambda message: message.chat.type != 'private')
+async def chat_message_handler(message: types.Message):
+    if not await is_chat_confirmed(message.chat.id):
+        return
+
+    async with db_pool.acquire() as conn:
+        boss = await conn.fetchrow(
+            "SELECT * FROM bosses WHERE chat_id=$1 AND status='active'",
+            message.chat.id
+        )
+        if not boss:
+            return
+
+        attack = await conn.fetchrow(
+            "SELECT damage FROM boss_attacks WHERE boss_id=$1 AND user_id=$2",
+            boss['id'], message.from_user.id
+        )
+
+        stats = await get_user_stats(message.from_user.id)
+        strength = stats['strength']
+        base_damage = int(await get_setting("boss_base_damage"))
+        # Урон зависит от силы + случайная составляющая
+        damage = base_damage + strength // 2 + random.randint(-3, 3)
+        damage = max(1, damage)
+
+        new_hp = boss['hp'] - damage
+        if new_hp < 0:
+            new_hp = 0
+
+        await conn.execute(
+            "UPDATE bosses SET hp=$1 WHERE id=$2",
+            new_hp, boss['id']
+        )
+
+        if not attack:
+            participants = boss['participants'] + [message.from_user.id]
+            await conn.execute(
+                "UPDATE bosses SET participants=$1 WHERE id=$2",
+                participants, boss['id']
+            )
+
+        await conn.execute(
+            "INSERT INTO boss_attacks (boss_id, user_id, damage, attack_time) VALUES ($1, $2, $3, $4) ON CONFLICT (boss_id, user_id) DO UPDATE SET damage = boss_attacks.damage + $3",
+            boss['id'], message.from_user.id, damage, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+
+        # Выбираем случайную фразу босса
+        if random.choice([True, False]):
+            phrase = random.choice(BOSS_ANGRY_PHRASES)
+        else:
+            phrase = random.choice(BOSS_HAPPY_PHRASES)
+
+        # Прогресс-бар HP
+        bar_length = 10
+        filled = int((boss['max_hp'] - new_hp) / boss['max_hp'] * bar_length) if boss['max_hp'] > 0 else 0
+        bar = "🟥" * filled + "⬜" * (bar_length - filled)
+
+        reply_text = f"{phrase.format(damage=damage, hp_remaining=new_hp)}\n{bar} {new_hp}/{boss['max_hp']} HP"
+
+        await auto_delete_reply(message, reply_text, delete_seconds=10)
+
+        if new_hp <= 0:
+            await finish_boss_fight(boss['id'])
+
+# ==================== ОБРАБОТКА НЕИЗВЕСТНЫХ КОМАНД В ЧАТЕ ====================
+@dp.message_handler(lambda message: message.text and message.text.startswith('/'))
+async def unknown_command(message: types.Message):
+    if message.chat.type == 'private':
+        return
+    if not await is_chat_confirmed(message.chat.id):
+        return
+    if await is_banned(message.from_user.id):
+        await auto_delete_reply(message, "⛔ Вы заблокированы.")
+        return
+    await auto_delete_reply(message, "❌ Неизвестная команда. Введи /help для списка доступных.")
