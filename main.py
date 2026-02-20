@@ -1874,7 +1874,7 @@ async def perform_cleanup(manual=False):
     cutoff_purchases = (now - timedelta(days=days_purchases)).strftime("%Y-%m-%d %H:%M:%S")
     cutoff_giveaways = (now - timedelta(days=days_giveaways)).strftime("%Y-%m-%d %H:%M:%S")
     cutoff_tasks = (now - timedelta(days=days_tasks)).strftime("%Y-%m-%d %H:%M:%S")
-    cutoff_smuggle = (now - timedelta(days=days_smuggle)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_smuggle = now - timedelta(days=days_smuggle)
     # Для TIMESTAMP
     cutoff_auctions = now - timedelta(days=days_auctions)
     cutoff_fight = now - timedelta(days=days_fight)
@@ -7659,7 +7659,7 @@ async def smuggle_check_loop():
             async with db_pool.acquire() as conn:
                 runs = await conn.fetch(
                     "SELECT * FROM smuggle_runs WHERE status='in_progress' AND end_time <= $1 AND notified=FALSE",
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    datetime.now()
                 )
                 for run in runs:
                     user_id = run['user_id']
