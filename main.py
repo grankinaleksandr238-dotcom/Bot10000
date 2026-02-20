@@ -7620,15 +7620,7 @@ async def list_admins(message: types.Message):
         text += f"• ID: {row['user_id']}, назначен: {row['added_date']}\n  Права: {perms_str}\n"
     await message.answer(text)
 # ==================== НЕДОСТАЮЩИЕ ФУНКЦИИ ДЛЯ КОНТРАБАНДЫ ====================
-async def get_smuggle_cooldown(user_id: int) -> Tuple[bool, int]:
-    """
-    Проверяет, может ли пользователь отправиться в новый рейс.
-    Возвращает (можно ли, сколько секунд осталось).
-    """
-    cooldown_minutes = int(await get_setting("smuggle_cooldown_minutes"))
-    # Используем глобальный кулдаун для команды smuggle
-    ok, remaining = await check_global_cooldown(user_id, "smuggle", cooldown_minutes)
-    return ok, remaining
+
 
 async def process_smuggle_runs():
     """
