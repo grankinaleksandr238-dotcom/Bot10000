@@ -1811,12 +1811,9 @@ async def roulette_spin(bet_type: str, bet_number: int = None) -> Tuple[int, str
 
 # ==================== ФУНКЦИИ ДЛЯ КОНТРАБАНДЫ ====================
 
-async def get_smuggle_cooldown(user_id: int) -> Tuple[bool, int]:
-    cooldown = int(await get_setting("smuggle_cooldown_minutes"))
-    return await check_global_cooldown(user_id, "smuggle", cooldown)
-
 async def set_smuggle_cooldown(user_id: int, penalty: int = 0):
-    cooldown_time = datetime.now() + timedelta(minutes=cooldown_minutes)  # исправлено
+    cooldown = int(await get_setting("smuggle_cooldown_minutes")) + penalty
+    cooldown_time = datetime.now() + timedelta(minutes=cooldown)
     async with db_pool.acquire() as conn:
         await conn.execute('''
             INSERT INTO global_cooldowns (user_id, command, last_used)
