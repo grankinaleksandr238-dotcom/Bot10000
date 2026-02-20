@@ -4996,7 +4996,7 @@ async def cmd_smuggle_chat(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    ok, remaining = await get_smuggle_cooldown(user_id)
+    ok, remaining = await check_smuggle_cooldown(user_id)
     if not ok:
         minutes = remaining // 60
         seconds = remaining % 60
