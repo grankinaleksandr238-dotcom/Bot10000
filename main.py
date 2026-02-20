@@ -7630,21 +7630,6 @@ async def get_smuggle_cooldown(user_id: int) -> Tuple[bool, int]:
     ok, remaining = await check_global_cooldown(user_id, "smuggle", cooldown_minutes)
     return ok, remaining
 
-async def set_smuggle_cooldown(user_id: int, penalty: int = 0):
-    """
-    Устанавливает кулдаун для команды smuggle с учётом штрафа.
-    """
-    cooldown = int(await get_setting("smuggle_cooldown_minutes")) + penalty
-    # Записываем время окончания кулдауна как last_used + cooldown минут
-    # В таблице global_cooldowns поле last_used типа TIMESTAMP, поэтому мы можем сохранить будущее время.
-    cooldown_time = datetime.now() + timedelta(minutes=cooldown)
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO global_cooldowns (user_id, command, last_used)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, command) DO UPDATE SET last_used = $3
-        ''', user_id, "smuggle", cooldown_time)
-
 async def process_smuggle_runs():
     """
     Фоновая задача: проверяет завершённые рейсы контрабанды,
