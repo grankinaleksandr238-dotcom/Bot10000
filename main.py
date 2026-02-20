@@ -7960,11 +7960,18 @@ async def advance_to_next_player(game_id: str, current_idx: int, players, conn):
 
 async def finish_game(game_id: str):
     async with db_pool.acquire() as conn:
-        players = await conn.fetch("SELECT * FROM game_players WHERE game_id=$1 ORDER BY value DESC", game_id)
+        # Получаем информацию о комнате (ставку)
+        room = await conn.fetchrow("SELECT bet_amount FROM multiplayer_games WHERE game_id=$1", game_id)
+        if not room:
+            return
+        bet = room['bet_amount']
+        
+        players = await conn.fetch("SELECT * FROM game_players WHERE game_id=$1", game_id)
         if not players:
             await conn.execute("DELETE FROM multiplayer_games WHERE game_id=$1", game_id)
             return
-        # Определяем победителя (макс. очков <=21, если все перебрали – тот, кто ближе к 21)
+
+        # Определяем победителя (макс. очков <=21)
         best_value = -1
         winner_id = None
         for p in players:
@@ -7974,44 +7981,35 @@ async def finish_game(game_id: str):
             if val <= 21 and val > best_value:
                 best_value = val
                 winner_id = p['user_id']
-        if winner_id is None:
-            # Все перебрали или сдались – выбираем минимальный перебор? По правилам обычно все проигрывают (банк забирает бот)
-            # Здесь просто все проигрывают, ставки не возвращаются.
-            pass
+
+        # Подсчитываем общий банк
+        total_bet = 0
+        for p in players:
+            if not p['surrendered']:
+                total_bet += bet
+                if p['doubled']:
+                    total_bet += bet
+
         # Начисляем выигрыш
         if winner_id:
-            total_bet = len(players) * room['bet_amount']
-            # Учитываем удвоения
-            for p in players:
-                if p['doubled']:
-                    total_bet += room['bet_amount']
-            # Учитываем сдавшихся (им уже вернуну)
             await update_user_balance(winner_id, total_bet, conn=conn)
-            await update_user_game_stats(winnerли половину)
-            await update_user_balance(winner_id, total_bet, conn=conn)
-            await update_user_game_stats_id, 'multiplayer', True, conn=conn)
-            # Для проигравших записы(winner_id, 'multiplayer', True, conn=conn)
-            # Для проигравшихваем статистику
-            for p in players:
- записываем статистику
-            for p in players:
-                if p['user_id'] != winner_id:
-                                   if p['user_id'] != winner_id:
-                    await update await update_user_game_stats(p['user_id'], 'multiplayer',_user_game_stats(p['user_id'], 'multi False, conn=conn)
-        # Оповplayer', False, conn=conn)
-        # Оповещаем
-        winnerещаем
-_name = (await bot.get_chat_member(game_id, winner_id        winner_name = (await bot.get_chat_member(game_id, winner_id)).user)).user.first_name if winner_id else "Никто"
-        for p in players.first_name if winner_id else "Никто"
+            await update_user_game_stats(winner_id, 'multiplayer', True, conn=conn)
+
+        # Статистика проигравшим и уведомления
         for p in players:
-           :
-            await bot.send_message(p['user_id'], f"🏆 И await bot.send_message(p['user_id'], f"🏆 Игра завершена! Победитель:гра завершена! Победитель: {winner_name}")
-        # Удаляем игру
-        await conn.execute("DELETE FROM game_players {winner_name}")
+            if p['user_id'] != winner_id:
+                await update_user_game_stats(p['user_id'], 'multiplayer', False, conn=conn)
+            # Получаем имя победителя для уведомления
+            if winner_id:
+                winner_user = await conn.fetchrow("SELECT first_name FROM users WHERE user_id=$1", winner_id)
+                winner_name = winner_user['first_name'] if winner_user else str(winner_id)
+            else:
+                winner_name = "Никто (все проиграли)"
+            await safe_send_message(p['user_id'], f"🏆 Игра завершена! Победитель: {winner_name}")
+
         # Удаляем игру
         await conn.execute("DELETE FROM game_players WHERE game_id=$1", game_id)
-        await conn.execute(" WHERE game_id=$1", game_id)
-        await conn.execute("DELETE FROM multiplayer_gDELETE FROM multiplayer_games WHERE game_id=$1", game_id)
+        await conn.execute("DELETE FROM multiplayer_games WHERE game_id=$1", game_id)
 
 @dp.message_handler(state=RoomChat.message)
 async defames WHERE game_id=$1", game_id)
