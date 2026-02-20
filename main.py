@@ -7995,7 +7995,7 @@ async def finish_game(game_id: str):
             await update_user_balance(winner_id, total_bet, conn=conn)
             await update_user_game_stats(winner_id, 'multiplayer', True, conn=conn)
 
-        # Статистика проигравшим и уведомления
+        #  проигравшим и уведомления
         for p in players:
             if p['user_id'] != winner_id:
                 await update_user_game_stats(p['user_id'], 'multiplayer', False, conn=conn)
@@ -8419,65 +8419,36 @@ async def on_startup(dp):
     await init_business_types()
     # Дополнительные проверки колон_types()
     # Дополнительные проверки колонок (на случай, если не добавились)
-    asyncок (на случай, если не добавились)
     async with db_pool.acquire() as conn:
- with db_pool.acquire() as conn:
-        await conn.execute("ALTER TABLE confirmed_chats ADD COLUMN IF        await conn.execute("ALTER TABLE confirmed_chats ADD COLUMN IF NOT EXISTS last_boss_status NOT EXISTS last_boss_status_time TEXT")
-        # Остальные ALTER_time TEXT")
-        # Остальные ALTER уже были в init_db, но можно уже были в init_db, но можно продублировать для надёжности
-    продублировать для надёжности
-    await asyncio.sleep await asyncio.sleep(2)
-    asyncio.create_task(2)
-    asyncio.create_task(boss(boss_spawn_loop())
-    asyncio.create_task(_spawn_loop())
-    asyncio.create_task(cleanup_loop())
-   cleanup_loop())
-    asyncio.create_task(ad_sender_loop())
-    as asyncio.create_task(ad_sender_loop())
-    asyncio.create_task(smuggle_check_yncio.create_task(smuggle_check_loop())
-loop())
-    asyncio.create_task(start_web_server())
-    logging.info    asyncio.create_task(start_web_server())
-    logging.info("🤖 Бот запущен и готов к работе!")
-    logging.info(f"("🤖 Бот запущен и готов к работе!")
-    logging.info(f👑 Суперадмины: {SU"👑 Суперадмины: {SUPER_ADMINS}")
-    logging.info(f"🗄 База данных: PostgreSQL")
+        await conn.execute("ALTER TABLE confirmed_chats ADD COLUMN IF NOT EXISTS last_boss_status_time TEXT")
+        # Остальные ALTER уже были в init_db, но можно продублировать для надёжности
 
-async defPER_ADMINS}")
+    await asyncio.sleep(2)
+    asyncio.create_task(boss_spawn_loop())
+    asyncio.create_task(cleanup_loop())
+    asyncio.create_task(ad_sender_loop())
+    asyncio.create_task(smuggle_check_loop())
+    asyncio.create_task(start_web_server())
+    logging.info("🤖 Бот запущен и готов к работе!")
+    logging.info(f"👑 Суперадмины: {SUPER_ADMINS}")
     logging.info(f"🗄 База данных: PostgreSQL")
 
 async def on_shutdown(dp):
     if db_pool:
-        await db on_shutdown(dp):
-    if db_pool:
-       _pool.close()
+        await db_pool.close()
     await dp.storage.close()
     await bot.close()
- await db_pool.close()
-    await dp.storage.close()
-       logging.info("Бот остановлен")
-
-if __name__ == await bot.close()
     logging.info("Бот остановлен")
 
 if __name__ == "__main__":
     while True:
-        "__main__":
-    while True:
         try:
-            executor.start_polling(dp, skip_updates=True, on_startup=on try:
             executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
-        except TerminatedBy_startup, on_shutdown=on_shutdown)
-        except TerminatedByOtherGetOtherGetUpdates:
-            logging.error("Конфликт с другим экземпляUpdates:
+        except TerminatedByOtherGetUpdates:
             logging.error("Конфликт с другим экземпляром. Жду 5 сек...")
-            time.sleep(5ром. Жду 5 сек...")
-            time.sleep)
+            time.sleep(5)
             continue
         except Exception as e:
             logging.error(f"Критическая ошибка: {e}")
             time.sleep(5)
-            continue
-        except Exception as e:
-            logging.error(f"Критическая ошибка: {e(5)
             continue
