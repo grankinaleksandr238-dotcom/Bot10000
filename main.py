@@ -5928,42 +5928,8 @@ async def ad_sender_loop():
                     last_sent = ad['last_sent']
                     if last_sent and (now - last_sent).total_seconds() < ad['interval_minutes'] * 60:
                         continue
-                    if ad['target'] in ('chats', 'all'):
-                        chats = await get_confirmed_chats()
-                        chat_ids = list(chats.keys())
-                        if chat_ids:
-                            chat_id = random.choice(chat_ids)
-                            await safe_send_chat(chat_id, ad['text'])
-                    if ad['target'] in ('private', 'all'):
-                        users = await conn.fetch("SELECT user_id FROM users WHERE user_id NOT IN (SELECT user_id FROM admins) ORDER BY RANDOM() LIMIT 1")
-                        if users:
-                            await safe_send_message(users[0]['user_id'], ad['text'])
-                    await conn.execute("UPDATE ads SET last_sent=$1 WHERE id=$2", now, ad['id'])
-        except Exception as e:
-            logging.error(f"Ad sender loop error: {e}")
 
-async def smuggle_check_loop():
-    """Периодически проверяет завершённые контрабандные рейсы и обрабатывает их."""
-    while True:
-        await asyncio.sleep(60)  # каждую минуту
-        try:
-            async with db_pool.acquire() as conn:
-                # Находим все завершённые, но ещё не обработанные рейсы
-                runs = await conn.fetch(
-                    "SELECT * FROM smuggle_runs WHERE status='in_progress' AND end_time <= NOW() AND notified=FALSE"
-                )
-                for run in runs:
-                    user_id = run['user_id']
-                    # Определяем исход
-                    success_chance = int(await get_setting("smuggle_success_chance"))
-                    caught_chance = int(await get_setting("smuggle_caught_chance"))
-                    lost_chance = int(await get_setting("smuggle_lost_chance"))
-                    rand = random.randint(1, 100)
-                    if rand <= success_chance:
-                        result = "success"
-                        # Количество контрабанды
-                        base = int(await get_setting("smuggle_base_amount"))
-           # ==================== ПОЛНЫЙ РАБОЧИЙ БОТ (НОВАЯ ВЕРСИЯ) ====================
+# ==================== ПОЛНЫЙ РАБОЧИЙ БОТ (НОВАЯ ВЕРСИЯ) ====================
 # Часть 6: Фоновые задачи, очистка данных, точка входа, веб-сервер, запуск бота
 # ==================== ИСПРАВЛЕНО: добавлена функция add_auto_delete_field ====================
 # - Добавлено определение функции add_auto_delete_field
