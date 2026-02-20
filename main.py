@@ -6178,6 +6178,221 @@ async def on_startup(dp):
     asyncio.create_task(smuggle_check_loop())
     asyncio.create_task(start_web_server())
     logging.info("🤖 Бот запущен и готов к работе!")
+# ==================== ПОЛНЫЙ РАБОЧИЙ БОТ (НОВАЯ ВЕРСИЯ) ====================
+# Часть 6: Фоновые задачи, очистка данных, точка входа, веб-сервер, запуск бота
+# ==================== ИСПРАВЛЕНО: добавлена функция add_auto_delete_field ====================
+# - Добавлено определение функции add_auto_delete_field
+# - Все остальные функции инициализации сохранены
+
+# ==================== ФУНКЦИЯ ДЛЯ ДОБАВЛЕНИЯ ПОЛЯ АВТОУДАЛЕНИЯ ====================
+async def add_auto_delete_field():
+    """Добавляет поле auto_delete_enabled в confirmed_chats, если его нет."""
+    async with db_pool.acquire() as conn:
+        try:
+            await conn.execute("ALTER TABLE confirmed_chats ADD COLUMN IF NOT EXISTS auto_delete_enabled BOOLEAN DEFAULT TRUE")
+            logging.info("✅ Поле auto_delete_enabled добавлено в таблицу confirmed_chats")
+        except Exception as e:
+            logging.error(f"Ошибка при добавлении поля auto_delete_enabled: {e}")
+
+# ==================== ИНИЦИАЛИЗАЦИЯ ТИПОВ БИЗНЕСОВ ====================
+async def init_business_types():
+    """Заполняет таблицу business_types начальными данными, если она пуста."""
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM business_types")
+        if count == 0:
+            businesses = [
+                ("Уличная забегаловка", "Маленькое кафе на районе, приносит стабильный, но скромный доход.", 5000, 10, 240, 0),
+                ("Нелегальная мастерская", "Подпольная мастерская по переделке техники. Риск выше, но и доход больше.", 15000, 30, 720, 50),
+                ("Контрабандный склад", "Склад для хранения товара. Позволяет накапливать больше дохода.", 30000, 50, 1200, 150),
+                ("Фрахтовый корабль", "Небольшое судно для перевозок. Хороший пассивный доход.", 50000, 80, 1920, 300),
+                ("Подпольное казино", "Нелегальное игорное заведение. Очень прибыльно, но требует авторитета.", 100000, 150, 3600, 500),
+            ]
+            for name, desc, cost, income, storage, req_auth in businesses:
+                await conn.execute(
+                    "INSERT INTO business_types (name, description, cost_smuggle, income_per_hour, max_storage, required_authority) VALUES ($1, $2, $3, $4, $5, $6)",
+                    name, desc, cost, income, storage, req_auth
+                )
+            logging.info("✅ Таблица business_types инициализирована")
+        else:
+            logging.info("✅ Таблица business_types уже содержит данные")
+
+# ==================== ФУНКЦИИ ОЧИСТКИ ====================
+async def perform_cleanup(manual=False):
+    """Удаляет старые записи согласно настройкам, включая офферы авторитета и рейсы."""
+    days_bosses = int(await get_setting("cleanup_days_bosses"))
+    days_auctions = int(await get_setting("cleanup_days_auctions"))
+    days_purchases = int(await get_setting("cleanup_days_purchases"))
+    days_giveaways = int(await get_setting("cleanup_days_giveaways"))
+    days_tasks = int(await get_setting("cleanup_days_user_tasks"))
+    days_fight = int(await get_setting("cleanup_days_fight_logs"))
+    days_smuggle = int(await get_setting("cleanup_days_smuggle"))
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM bosses WHERE status IN ('defeated', 'expired') AND spawned_at < NOW() - INTERVAL '1 day' * $1", days_bosses)
+        await conn.execute("DELETE FROM boss_attacks WHERE attack_time < NOW() - INTERVAL '1 day' * $1", days_bosses)
+        await conn.execute("DELETE FROM auctions WHERE status='ended' AND end_time < NOW() - INTERVAL '1 day' * $1", days_auctions)
+        await conn.execute("DELETE FROM purchases WHERE status IN ('completed','rejected') AND purchase_date < NOW() - INTERVAL '1 day' * $1", days_purchases)
+        await conn.execute("DELETE FROM giveaways WHERE status='completed' AND end_date < NOW() - INTERVAL '1 day' * $1", days_giveaways)
+        await conn.execute("DELETE FROM user_tasks WHERE expires_at IS NOT NULL AND expires_at < NOW()")
+        await conn.execute("DELETE FROM fight_logs WHERE timestamp < NOW() - INTERVAL '1 day' * $1", days_fight)
+        cooldown = int(await get_setting("fight_cooldown_minutes"))
+        await conn.execute("DELETE FROM global_cooldowns WHERE last_used < NOW() - INTERVAL '1 minute' * $1", cooldown * 2)
+        await conn.execute("DELETE FROM authority_offers WHERE status IN ('sold', 'cancelled')")
+        await conn.execute("DELETE FROM authority_offers WHERE status='active' AND created_at < NOW() - INTERVAL '30 days'")
+        await conn.execute("DELETE FROM smuggle_runs WHERE status IN ('completed', 'failed') AND end_time < NOW() - INTERVAL '1 day' * $1", days_smuggle)
+        
+    if manual:
+        logging.info("Ручная очистка выполнена.")
+    else:
+        logging.info("Автоматическая очистка логов выполнена.")
+
+# ==================== ФОНОВЫЕ ЗАДАЧИ ====================
+async def boss_spawn_loop():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            confirmed = await get_confirmed_chats()
+            now = datetime.now()
+            for chat_id, data in confirmed.items():
+                boss_max_per_day = int(await get_setting("boss_max_per_day"))
+                boss_spawn_count = data.get('boss_spawn_count', 0)
+                if boss_spawn_count >= boss_max_per_day:
+                    continue
+                last_spawn_str = data.get('boss_last_spawn')
+                if last_spawn_str:
+                    last_spawn = last_spawn_str
+                    min_interval = int(await get_setting("boss_min_interval"))
+                    if (now - last_spawn).total_seconds() < min_interval * 60:
+                        continue
+                chance = int(await get_setting("boss_spawn_chance"))
+                if random.randint(1, 100) <= chance:
+                    await spawn_boss(chat_id)
+        except Exception as e:
+            logging.error(f"Boss spawn loop error: {e}")
+
+async def cleanup_loop():
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            await perform_cleanup(manual=False)
+        except Exception as e:
+            logging.error(f"Cleanup loop error: {e}")
+
+async def ad_sender_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if db_pool is None:
+                continue
+            async with db_pool.acquire() as conn:
+                ads = await conn.fetch("SELECT * FROM ads WHERE enabled=TRUE")
+                now = datetime.now()
+                for ad in ads:
+                    last_sent = ad['last_sent']
+                    if last_sent and (now - last_sent).total_seconds() < ad['interval_minutes'] * 60:
+                        continue
+                    if ad['target'] in ('chats', 'all'):
+                        chats = await get_confirmed_chats()
+                        chat_ids = list(chats.keys())
+                        if chat_ids:
+                            chat_id = random.choice(chat_ids)
+                            await safe_send_chat(chat_id, ad['text'])
+                    if ad['target'] in ('private', 'all'):
+                        users = await conn.fetch("SELECT user_id FROM users WHERE user_id NOT IN (SELECT user_id FROM admins) ORDER BY RANDOM() LIMIT 1")
+                        if users:
+                            await safe_send_message(users[0]['user_id'], ad['text'])
+                    await conn.execute("UPDATE ads SET last_sent=$1 WHERE id=$2", now, ad['id'])
+        except Exception as e:
+            logging.error(f"Ad sender loop error: {e}")
+
+async def smuggle_check_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            async with db_pool.acquire() as conn:
+                runs = await conn.fetch(
+                    "SELECT * FROM smuggle_runs WHERE status='in_progress' AND end_time <= NOW() AND notified=FALSE"
+                )
+                for run in runs:
+                    user_id = run['user_id']
+                    success_chance = int(await get_setting("smuggle_success_chance"))
+                    caught_chance = int(await get_setting("smuggle_caught_chance"))
+                    lost_chance = int(await get_setting("smuggle_lost_chance"))
+                    rand = random.randint(1, 100)
+                    if rand <= success_chance:
+                        result = "success"
+                        base = int(await get_setting("smuggle_base_amount"))
+                        auth = await get_user_global_authority(user_id)
+                        multiplier = 1 + auth * float(await get_setting("smuggle_authority_multiplier"))
+                        amount = int(base * multiplier)
+                        await conn.execute(
+                            "UPDATE users SET smuggle_goods = smuggle_goods + $1, smuggle_success = smuggle_success + 1 WHERE user_id=$2",
+                            amount, user_id
+                        )
+                        await set_global_cooldown(user_id, "smuggle")
+                        notify_text = get_random_phrase(SMUGGLE_SUCCESS_PHRASES, amount=amount)
+                    elif rand <= success_chance + caught_chance:
+                        result = "caught"
+                        penalty = int(await get_setting("smuggle_fail_penalty_minutes"))
+                        await set_global_cooldown(user_id, "smuggle")
+                        async with db_pool.acquire() as conn2:
+                            await conn2.execute(
+                                "UPDATE global_cooldowns SET last_used = $1 WHERE user_id=$2 AND command='smuggle'",
+                                datetime.now() + timedelta(minutes=penalty), user_id
+                            )
+                        await conn.execute(
+                            "UPDATE users SET smuggle_fail = smuggle_fail + 1 WHERE user_id=$1",
+                            user_id
+                        )
+                        notify_text = get_random_phrase(SMUGGLE_CAUGHT_PHRASES)
+                    else:
+                        result = "lost"
+                        await set_global_cooldown(user_id, "smuggle")
+                        await conn.execute(
+                            "UPDATE users SET smuggle_fail = smuggle_fail + 1 WHERE user_id=$1",
+                            user_id
+                        )
+                        notify_text = get_random_phrase(SMUGGLE_LOST_PHRASES)
+
+                    await conn.execute(
+                        "UPDATE smuggle_runs SET status='completed', result=$1, notified=TRUE WHERE id=$2",
+                        result, run['id']
+                    )
+                    await safe_send_message(user_id, notify_text)
+        except Exception as e:
+            logging.error(f"Smuggle check error: {e}")
+
+# ==================== ВЕБ-СЕРВЕР ====================
+async def handle(request):
+    return web.Response(text="Bot is running")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server started on port {port}")
+
+# ==================== MAIN ====================
+async def on_startup(dp):
+    await before_start()
+    await create_db_pool()
+    await init_db()
+    await add_auto_delete_field()
+    await add_missing_user_columns()
+    await add_smuggle_columns()
+    await create_smuggle_tables()
+    await init_business_types()
+    await asyncio.sleep(2)
+    asyncio.create_task(boss_spawn_loop())
+    asyncio.create_task(cleanup_loop())
+    asyncio.create_task(ad_sender_loop())
+    asyncio.create_task(smuggle_check_loop())
+    asyncio.create_task(start_web_server())
+    logging.info("🤖 Бот запущен и готов к работе!")
     logging.info(f"👑 Суперадмины: {SUPER_ADMINS}")
     logging.info(f"🗄 База данных: PostgreSQL")
 
