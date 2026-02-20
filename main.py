@@ -1,4 +1,4 @@
-# ==================== ЧАСТЬ 1: ИМПОРТЫ, НАСТРОЙКИ, БАЗА ДАННЫХ, БЕЗОПАСНАЯ ОТПРАВКА ====================
+# # ==================== ЧАСТЬ 1: ИМПОРТЫ, НАСТРОЙКИ, БАЗА ДАННЫХ, БЕЗОПАСНАЯ ОТПРАВКА ====================
 
 import asyncio
 import logging
@@ -61,12 +61,12 @@ DEFAULT_SETTINGS = {
     "max_theft_amount": "15",
 
     # Казино и игры (подобраны так, чтобы казино имело преимущество ~5-10%)
-    "casino_win_chance": "45",           # чуть меньше 50%
+    "casino_win_chance": "45",
     "casino_min_bet": "1",
     "casino_max_bet": "1000",
-    "casino_multiplier": "2",            # выигрыш x2, но шанс 45% -> преимущество казино 10%
+    "casino_multiplier": "2",
     "dice_multiplier": "2",
-    "dice_win_threshold": "7",           # больше 7 — победа
+    "dice_win_threshold": "7",
     "guess_multiplier": "5",
     "guess_reputation": "1",
     "slots_multiplier_three": "3",
@@ -74,7 +74,7 @@ DEFAULT_SETTINGS = {
     "slots_multiplier_seven": "10",
     "slots_min_bet": "1",
     "slots_max_bet": "500",
-    "slots_win_probability": "30",       # общий шанс выигрыша в слотах
+    "slots_win_probability": "30",
     "roulette_color_multiplier": "2",
     "roulette_green_multiplier": "18",
     "roulette_number_multiplier": "36",
@@ -158,10 +158,10 @@ DEFAULT_SETTINGS = {
     "gym_defense_cost": "10",
 
     # Бизнесы
-    "business_base_price": "5000",        # базовая цена первого уровня
-    "business_price_increase": "1.5",     # множитель цены за каждый уровень
-    "business_income_per_level": "5",      # доход в час за уровень (в центах)
-    "business_upgrade_cost_per_level": "2000",  # стоимость апгрейда
+    "business_base_price": "5000",
+    "business_price_increase": "1.5",
+    "business_income_per_level": "5",
+    "business_upgrade_cost_per_level": "2000",
 
     # Контрабанда
     "smuggle_min_duration": "30",
@@ -199,7 +199,7 @@ MAX_ROOMS = 20
 MIN_PLAYERS = 2
 MAX_PLAYERS = 5
 MIN_BET = 3
-MAX_COMPLETED_GIVEAWAYS = 10   # хранить последние 10 завершённых розыгрышей
+MAX_COMPLETED_GIVEAWAYS = 10
 
 # Права админов
 PERMISSIONS_LIST = [
@@ -241,6 +241,263 @@ last_confirmed_chats_update = 0
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
+
+# ==================== ТЕКСТОВЫЕ ФРАЗЫ ====================
+BONUS_PHRASES = [
+    "🎉 Отлично, лови +{bonus} баксов!",
+    "💰 Ты сегодня богат! +{bonus} баксов!",
+    "🌟 Удача улыбнулась! +{bonus} баксов в карман!",
+    "🍀 Держи +{bonus} баксов на удачу!",
+    "🎁 Поздравляю! +{bonus} баксов твои!"
+]
+
+CASINO_WIN_PHRASES = [
+    "🎰 Ура! Ты выиграл {win} баксов (чистыми {profit})!",
+    "🍒 Джекпот! +{profit} баксов!",
+    "💫 Фортуна на твоей стороне! +{profit} баксов!",
+    "🎲 Победа! {profit} баксов твои!",
+    "✨ Ты обыграл казино! +{profit} баксов!"
+]
+
+CASINO_LOSE_PHRASES = [
+    "😢 Обидно, потерял {loss} баксов.",
+    "💔 Не повезло, минус {loss}.",
+    "📉 Проигрыш -{loss} баксов.",
+    "🍂 В следующий раз повезёт, а пока -{loss}.",
+    "⚡️ Увы, -{loss} баксов."
+]
+
+PURCHASE_PHRASES = [
+    "✅ Куплено! Админ скоро свяжется.",
+    "🛒 Товар твой! Жди админа.",
+    "🎁 Отличная покупка! Админ уже в курсе.",
+    "💎 Приятной игры! Админ напишет."
+]
+
+DICE_WIN_PHRASES = [
+    "🎲 {dice1} + {dice2} = {total} — Победа! +{profit} баксов!",
+    "🎲 Круто! {dice1}+{dice2}={total}, ты выиграл {profit}!",
+    "🎲 Хороший бросок! {total} очков, выигрыш {profit}!"
+]
+
+DICE_LOSE_PHRASES = [
+    "🎲 {dice1} + {dice2} = {total} — Проигрыш. -{loss} баксов.",
+    "🎲 Эх, {total} очков, не повезло. -{loss}.",
+    "🎲 В следующий раз повезёт, -{loss} баксов."
+]
+
+GUESS_WIN_PHRASES = [
+    "🔢 Ты угадал! Было {secret}. Выигрыш: +{profit} баксов и +{rep} репутации!",
+    "🔢 Красава! Число {secret}, твой выигрыш {profit} баксов!",
+    "🔢 Удача! +{profit} баксов, репутация +{rep}!"
+]
+
+GUESS_LOSE_PHRASES = [
+    "🔢 Не угадал. Было {secret}. -{loss} баксов.",
+    "🔢 Увы, загадано {secret}. Теряешь {loss} баксов.",
+    "🔢 Не повезло, правильный ответ {secret}. -{loss}."
+]
+
+SLOTS_WIN_PHRASES = [
+    "🍒 {combo} — Ура! Выигрыш x{multiplier}! +{profit} баксов!",
+    "🍋 Джекпот! {combo} приносит {profit} баксов!",
+    "🍊 Крутая комбинация! x{multiplier}, +{profit} баксов!",
+    "💎 Бриллианты! Твой выигрыш: {profit} баксов!"
+]
+
+SLOTS_LOSE_PHRASES = [
+    "🍒 {combo} — Не повезло. -{loss} баксов.",
+    "🍋 Мимо. Потеряно {loss} баксов.",
+    "🍊 В следующий раз повезёт. -{loss}."
+]
+
+ROULETTE_WIN_PHRASES = [
+    "🎡 Выпало {number} {color}! Ты выиграл {profit} баксов!",
+    "🎡 Удача! Ставка сыграла, +{profit} баксов!",
+    "🎡 Круто! {profit} баксов твои!"
+]
+
+ROULETTE_LOSE_PHRASES = [
+    "🎡 Выпало {number} {color}. Твоя ставка не сыграла. -{loss} баксов.",
+    "🎡 Увы, не в этот раз. Потеряно {loss} баксов.",
+    "🎡 Мимо кассы. -{loss}."
+]
+
+FIGHT_HIT_PHRASES = [
+    "💥 Ты нанёс {damage} урона банде! Заработал {authority} авторитета.",
+    "⚡️ Твой удар точный! +{damage} урона, +{authority} авторитета.",
+    "🔥 Ты нанёс {damage} урона и получил {authority} авторитета.",
+    "🤜 Хрясь! Банда получила {damage} урона. Твой авторитет +{authority}.",
+    "👊 Смачный удар! {damage} урона, {authority} авторитета.",
+]
+
+FIGHT_CRIT_PHRASES = [
+    "💢 СОКРУШИТЕЛЬНЫЙ УДАР! Ты нанёс {damage} урона (крит!) и заработал {authority} авторитета.",
+    "🌟 Ты в ярости! Критический урон {damage}, авторитет +{authority}.",
+    "⚡️ МОЛНИЕНОСНЫЙ ВЫПАД! {damage} урона, +{authority} авторитета.",
+]
+
+FIGHT_COUNTER_PHRASES = [
+    "😵 Банда контратаковала! Ты потерял {damage} баксов и не получил авторитет.",
+    "💥 Ответный удар! Ты потерял {damage} баксов.",
+    "👊 Тебя самого ударили! Минус {damage} баксов.",
+]
+
+AUTHORITY_SELL_PHRASES = [
+    "💰 Продажа {amount} авторитета по {price} баксов/ед.",
+    "💼 Предложение создано! ID: {offer_id}",
+    "✅ Покупка совершена! Ты получил {amount} авторитета.",
+]
+
+SMUGGLE_START_PHRASES = [
+    "🛥 Ты отправился в контрабандный рейс! В этот раз груз – {cargo}. Вернёшься примерно {end_time}.",
+    "📦 Груз загружен, судно вышло в море. Капитан обещает вернуться к {end_time}. Груз: {cargo}.",
+    "🚤 Ты взял курс на нейтральные воды. На борту – {cargo}. Финиш ориентировочно {end_time}.",
+    "⚓ Под покровом ночи ты вышел в море. Товар: {cargo}. Жди возвращения к {end_time}.",
+]
+
+SMUGGLE_CARGO = [
+    "ящики с сигарами", "партия виски", "контрабандное оружие", "драгоценные камни",
+    "золотые слитки", "антиквариат", "редкие лекарства", "элитный алкоголь",
+    "техника без пошлин", "запрещённые книги", "экзотические животные", "наркотические вещества"
+]
+
+SMUGGLE_SUCCESS_PHRASES = [
+    "✅ Рейс завершён успешно! Ты привёз {amount} ед. контрабанды. Таможня не заметила.",
+    "💰 Товар доставлен заказчику. Твоя доля: {amount} ед. Отличная работа!",
+    "🎉 Пограничников удалось обмануть! +{amount} контрабанды.",
+    "🚢 Корабль благополучно вернулся в порт. Груз цел: {amount} ед.",
+]
+
+SMUGGLE_CAUGHT_PHRASES = [
+    "🚨 Береговая охрана перехватила твоё судно! Ты потерял груз и теперь отсиживаешься.",
+    "⛓ Полиция накрыла явочную квартиру. Придётся залечь на дно (кулдаун увеличен).",
+    "👮‍♂️ Менты вышли на след. Контрабанда конфискована. Тебя объявили в розыск.",
+    "🔫 Перестрелка с таможенниками! Пришлось бросить груз и спасаться бегством.",
+]
+
+SMUGGLE_LOST_PHRASES = [
+    "🌊 Шторм уничтожил твоё судно! Ты ничего не привёз.",
+    "💥 Корабль напоролся на рифы. Груз утонул.",
+    "🔥 Двигатель взорвался. Придётся начинать сначала.",
+    "🏝 Ты сел на мель на необитаемом острове. Спасся, но без груза.",
+]
+
+MULTIPLAYER_PHRASES = [
+    "🎮 Комната {game_id} создана!",
+    "👥 Игроки: {players}",
+    "🎯 Твой ход!",
+    "🏆 Победитель: {winner}",
+]
+
+BUSINESS_BUY_PHRASES = [
+    "✅ Ты приобрёл бизнес «{name}»! Он будет приносить доход.",
+    "🏪 Поздравляю с покупкой! Теперь у тебя есть {name}.",
+]
+
+BUSINESS_COLLECT_PHRASES = [
+    "💰 Ты собрал {coins} баксов и {cents} центов с бизнеса «{name}».",
+    "💵 Прибыль от {name}: {coins} баксов {cents} центов.",
+]
+
+BUSINESS_NO_INCOME = [
+    "⏳ В твоих бизнесах пока нет дохода. Загляни позже.",
+]
+
+GIVEAWAY_COMPLETED_PHRASE = [
+    "🏁 Розыгрыш #{id} завершён! Победитель: {winner}",
+    "🎉 Розыгрыш «{prize}» окончен! Список победителей: {winners}",
+]
+
+BOSS_SPAWN_PHRASES = [
+    "⚠️ ВНИМАНИЕ! В чате появился {name} (Уровень {level})! Здоровье: {hp}",
+    "👾 Босс {name} пришёл навестить нас! Уровень {level}, HP: {hp}",
+    "🔥 Легендарный {name} пробудился! Уровень {level}, здоровье: {hp}",
+]
+
+BOSS_HIT_PHRASES = [
+    "💥 Ты нанёс {damage} урона!",
+    "⚡️ Удар! -{damage} HP",
+    "🔥 Критическое попадание! {damage} урона",
+]
+
+BOSS_MISS_PHRASES = [
+    "💨 Промах! Босс уклонился",
+    "😵 Твоя атака не достигла цели",
+    "🛡 Босс отразил удар",
+]
+
+BOSS_DEATH_PHRASES = [
+    "🏆 Босс {name} повержен! Все участники получают награду!",
+    "🎉 Победа! {name} пал! Награда разделена между участниками",
+    "💀 Босс уничтожен! Спасибо за участие!",
+]
+
+BOSS_STATUS_PHRASES = [
+    "👾 {name} | Уровень {level} | HP: {current_hp}/{max_hp}",
+]
+
+THEFT_CHOICE_PHRASES = [
+    "🔫 Выбери цель:",
+    "💢 Кого будем грабить?",
+    "😈 Куда направим бандитские лапы?"
+]
+
+THEFT_COOLDOWN_PHRASES = [
+    "⏳ Ты ещё не остыл. Подожди {minutes} мин.",
+    "🕐 Полегче! Отдохни {minutes} минут.",
+    "😴 Слишком часто. Возвращайся через {minutes} мин."
+]
+
+THEFT_NO_MONEY_PHRASES = [
+    "😕 У тебя нет баксов на подготовку к краже!",
+    "💸 Сначала заработай!",
+    "💰 Пустой карман – не до криминала."
+]
+
+THEFT_SUCCESS_PHRASES = [
+    "🔫 Отлично! Ты украл {amount} баксов у {target}!",
+    "💰 Хорошо пошло! {amount} баксов у {target} теперь твои!",
+    "🦹‍♂️ Удачная кража! +{amount} от {target}",
+    "😈 Ты невидимка! +{amount} баксов!"
+]
+
+THEFT_FAIL_PHRASES = [
+    "😢 Облом, тебя спалили! Ничего не украл.",
+    "🚨 {target} оказался бдительным!",
+    "👮‍♂️ Пришлось сваливать, 0 баксов.",
+    "💔 Не фортануло."
+]
+
+THEFT_DEFENSE_PHRASES = [
+    "🛡️ {target} отразил атаку! Ты потерял {penalty} баксов.",
+    "💥 Бабах! {target} выставил защиту, ты лишился {penalty} баксов.",
+    "😱 Засада! Ты потерял {penalty} баксов."
+]
+
+THEFT_VICTIM_DEFENSE_PHRASES = [
+    "🛡️ Твоя защита сработала! {attacker} ничего не украл и потерял {penalty} баксов.",
+    "💪 Отлично! Отбил атаку {attacker} и получил {penalty} баксов.",
+    "😎 Ха! {attacker} думал поживиться, а сам потерял {penalty} баксов."
+]
+
+CHAT_WIN_PHRASES = [
+    "🔥 {name} только что выиграл {amount} баксов в казино!",
+    "💰 Удача на стороне {name}: +{amount} баксов!",
+    "🎰 {name} сорвал куш — {amount} баксов!"
+]
+
+CHAT_PURCHASE_PHRASES = [
+    "🛒 {name} купил {item} за {price} баксов!",
+    "🎁 {name} приобрёл {item}! Админ уже в пути.",
+    "💎 {name} потратил {price} баксов на {item}!"
+]
+
+CHAT_GIVEAWAY_PHRASES = [
+    "🎁 Не пропусти розыгрыш! Осталось {time}",
+    "⏰ Напоминание: розыгрыш {prize} заканчивается через {time}",
+    "🔥 Участвуй в розыгрыше {prize}! Осталось {time}"
+]
 
 # ==================== МИДЛВАРЬ ДЛЯ ТРОТТЛИНГА ====================
 class ThrottlingMiddleware(BaseMiddleware):
@@ -411,7 +668,7 @@ async def init_db():
             )
         ''')
 
-        # Таблица бизнесов пользователей (новая, с уровнями)
+        # Таблица бизнесов пользователей
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS user_businesses (
                 id SERIAL PRIMARY KEY,
@@ -424,7 +681,7 @@ async def init_db():
             )
         ''')
 
-        # Таблица подтверждённых чатов
+        # Таблица подтверждённых чатов (ДОБАВЛЕНА КОЛОНКА last_boss_status_time)
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS confirmed_chats (
                 chat_id BIGINT PRIMARY KEY,
@@ -438,7 +695,8 @@ async def init_db():
                 gift_count_today INTEGER DEFAULT 0,
                 boss_last_spawn TEXT,
                 boss_spawn_count INTEGER DEFAULT 0,
-                auto_delete_enabled BOOLEAN DEFAULT TRUE
+                auto_delete_enabled BOOLEAN DEFAULT TRUE,
+                last_boss_status_time TEXT
             )
         ''')
 
@@ -937,7 +1195,6 @@ async def check_subscription(user_id: int):
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def progress_bar(current, total, length=10):
-    """Красивый прогресс-бар из квадратиков."""
     if total <= 0:
         return "⬜" * length
     filled = int(current / total * length)
