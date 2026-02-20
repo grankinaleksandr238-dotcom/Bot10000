@@ -7570,3 +7570,296 @@ async def list_admins(message: types.Message):
         perms_str = ', '.join(perms) if perms else 'нет прав'
         text += f"• ID: {row['user_id']}, назначен: {row['added_date']}\n  Права: {perms_str}\n"
     await message.answer(text)
+# ==================== НЕДОСТАЮЩИЕ ФУНКЦИИ ДЛЯ КОНТРАБАНДЫ ====================
+async def get_smuggle_cooldown(user_id: int) -> Tuple[bool, int]:
+    """
+    Проверяет, может ли пользователь отправиться в новый рейс.
+    Возвращает (можно ли, сколько секунд осталось).
+    """
+    cooldown_minutes = int(await get_setting("smuggle_cooldown_minutes"))
+    # Используем глобальный кулдаун для команды smuggle
+    ok, remaining = await check_global_cooldown(user_id, "smuggle", cooldown_minutes)
+    return ok, remaining
+
+async def set_smuggle_cooldown(user_id: int, penalty: int = 0):
+    """
+    Устанавливает кулдаун для команды smuggle с учётом штрафа.
+    """
+    cooldown = int(await get_setting("smuggle_cooldown_minutes")) + penalty
+    # Записываем время окончания кулдауна как last_used + cooldown минут
+    # В таблице global_cooldowns поле last_used типа TIMESTAMP, поэтому мы можем сохранить будущее время.
+    cooldown_time = datetime.now() + timedelta(minutes=cooldown)
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO global_cooldowns (user_id, command, last_used)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, command) DO UPDATE SET last_used = $3
+        ''', user_id, "smuggle", cooldown_time)
+
+async def process_smuggle_runs():
+    """
+    Фоновая задача: проверяет завершённые рейсы контрабанды,
+    вычисляет результат и начисляет награду или штраф.
+    """
+    while True:
+        try:
+            await asyncio.sleep(30)  # проверяем каждые 30 секунд
+            now = datetime.now()
+            async with db_pool.acquire() as conn:
+                # Находим рейсы, которые должны были завершиться и ещё не обработаны
+                runs = await conn.fetch("""
+                    SELECT * FROM smuggle_runs
+                    WHERE status = 'in_progress' AND end_time <= $1 AND notified = FALSE
+                """, now.strftime("%Y-%m-%d %H:%M:%S"))
+
+                for run in runs:
+                    user_id = run['user_id']
+                    chat_id = run['chat_id']
+
+                    # Определяем исход рейса
+                    success_chance = int(await get_setting("smuggle_success_chance"))
+                    caught_chance = int(await get_setting("smuggle_caught_chance"))
+                    lost_chance = int(await get_setting("smuggle_lost_chance"))
+
+                    rand = random.randint(1, 100)
+                    if rand <= success_chance:
+                        # Успех
+                        base_amount = int(await get_setting("smuggle_base_amount"))
+                        authority_mult = float(await get_setting("smuggle_authority_multiplier"))
+                        global_authority = await get_user_global_authority(user_id)
+                        amount = base_amount + int(global_authority * authority_mult)
+                        await update_user_global_authority(user_id, amount)
+                        await conn.execute("UPDATE users SET smuggle_goods = smuggle_goods + $1, smuggle_success = smuggle_success + 1 WHERE user_id = $2", amount, user_id)
+                        result_text = get_random_phrase(SMUGGLE_SUCCESS_PHRASES, amount=amount)
+                        status = 'completed'
+                        penalty = 0
+                    elif rand <= success_chance + caught_chance:
+                        # Пойман
+                        penalty = int(await get_setting("smuggle_fail_penalty_minutes"))
+                        await conn.execute("UPDATE users SET smuggle_fail = smuggle_fail + 1 WHERE user_id = $1", user_id)
+                        result_text = get_random_phrase(SMUGGLE_CAUGHT_PHRASES)
+                        status = 'failed'
+                    else:
+                        # Потерян груз
+                        await conn.execute("UPDATE users SET smuggle_fail = smuggle_fail + 1 WHERE user_id = $1", user_id)
+                        result_text = get_random_phrase(SMUGGLE_LOST_PHRASES)
+                        status = 'failed'
+                        penalty = 0
+
+                    # Отмечаем рейс как обработанный
+                    await conn.execute("UPDATE smuggle_runs SET status = $1, notified = TRUE, result = $2 WHERE id = $3",
+                                       status, result_text, run['id'])
+
+                    # Отправляем результат пользователю
+                    if chat_id:
+                        # Если рейс был начат в чате, отвечаем в чат (упоминаем пользователя)
+                        try:
+                            await bot.send_message(chat_id, f"{result_text}\n(для @{run['user_id']})")
+                        except:
+                            pass
+                    else:
+                        await safe_send_message(user_id, result_text)
+
+                    # Устанавливаем кулдаун с учётом штрафа
+                    await set_smuggle_cooldown(user_id, penalty)
+
+        except Exception as e:
+            logging.error(f"Error in process_smuggle_runs: {e}")
+            await asyncio.sleep(60)
+
+# ==================== ФОНОВАЯ ЗАДАЧА ДЛЯ АУКЦИОНОВ ====================
+async def check_auctions():
+    """
+    Проверяет аукционы, у которых истекло время, и завершает их.
+    """
+    while True:
+        try:
+            await asyncio.sleep(60)  # раз в минуту
+            now = datetime.now()
+            async with db_pool.acquire() as conn:
+                # Активные аукционы с истекшим end_time
+                expired = await conn.fetch("""
+                    SELECT * FROM auctions
+                    WHERE status = 'active' AND end_time IS NOT NULL AND end_time <= $1
+                """, now.strftime("%Y-%m-%d %H:%M:%S"))
+
+                for auction in expired:
+                    auction_id = auction['id']
+                    # Определяем победителя (последняя ставка)
+                    winner_bid = await conn.fetchrow("""
+                        SELECT user_id, bid_amount FROM auction_bids
+                        WHERE auction_id = $1
+                        ORDER BY bid_amount DESC, bid_time ASC
+                        LIMIT 1
+                    """, auction_id)
+
+                    if winner_bid:
+                        winner_id = winner_bid['user_id']
+                        final_price = winner_bid['bid_amount']
+                        await conn.execute(
+                            "UPDATE auctions SET status = 'ended', winner_id = $1, current_price = $2 WHERE id = $3",
+                            winner_id, final_price, auction_id
+                        )
+                        # Уведомляем победителя и создателя
+                        await safe_send_message(winner_id, f"🎉 Поздравляем! Вы выиграли аукцион «{auction['item_name']}» с ценой {final_price} баксов. Админ скоро свяжется.")
+                        await safe_send_message(auction['created_by'], f"🏁 Аукцион «{auction['item_name']}» завершён. Победитель: {winner_id}, цена: {final_price}.")
+                    else:
+                        # Нет ставок
+                        await conn.execute("UPDATE auctions SET status = 'ended', winner_id = NULL WHERE id = $1", auction_id)
+                        await safe_send_message(auction['created_by'], f"🏁 Аукцион «{auction['item_name']}» завершён без ставок.")
+
+        except Exception as e:
+            logging.error(f"Error in check_auctions: {e}")
+            await asyncio.sleep(60)
+
+# ==================== ФОНОВАЯ ЗАДАЧА ДЛЯ БОССОВ (СПАВН ПО РАСПИСАНИЮ) ====================
+async def boss_spawn_scheduler():
+    """
+    Периодически пытается создать босса в случайном подтверждённом чате
+    с учётом настроек (шанс, интервал, лимит в день).
+    """
+    while True:
+        try:
+            # Проверяем каждые 30 минут (можно настроить)
+            await asyncio.sleep(1800)  # 30 минут
+            spawn_chance = int(await get_setting("boss_spawn_chance"))
+            if random.randint(1, 100) > spawn_chance:
+                continue
+
+            # Получаем список подтверждённых чатов
+            confirmed = await get_confirmed_chats()
+            if not confirmed:
+                continue
+
+            # Выбираем случайный чат
+            chat_id = random.choice(list(confirmed.keys()))
+            chat_data = confirmed[chat_id]
+
+            # Проверяем, не превышен ли лимит боссов в день
+            max_per_day = int(await get_setting("boss_max_per_day"))
+            today = date.today().isoformat()
+            last_spawn_str = chat_data.get('boss_last_spawn')
+            spawn_count = chat_data.get('boss_spawn_count', 0)
+
+            if last_spawn_str:
+                try:
+                    last_spawn_date = datetime.strptime(last_spawn_str, "%Y-%m-%d %H:%M:%S").date()
+                    if last_spawn_date == date.today():
+                        if spawn_count >= max_per_day:
+                            continue
+                    else:
+                        # Новый день, сбрасываем счётчик
+                        async with db_pool.acquire() as conn:
+                            await conn.execute("UPDATE confirmed_chats SET boss_spawn_count = 0 WHERE chat_id = $1", chat_id)
+                except:
+                    pass
+
+            # Проверяем, нет ли уже активного босса в чате
+            async with db_pool.acquire() as conn:
+                existing = await conn.fetchval("SELECT 1 FROM bosses WHERE chat_id = $1 AND status = 'active'", chat_id)
+                if existing:
+                    continue
+
+            # Спавним босса
+            level = random.randint(1, 5)
+            await spawn_boss(chat_id, level=level)
+
+        except Exception as e:
+            logging.error(f"Error in boss_spawn_scheduler: {e}")
+            await asyncio.sleep(60)
+
+# ==================== ФОНОВАЯ ЗАДАЧА ДЛЯ РАССЫЛКИ РЕКЛАМЫ ====================
+async def ad_sender():
+    """
+    Периодически отправляет рекламные сообщения в соответствии с настройками.
+    """
+    while True:
+        try:
+            # Проверяем каждые 5 минут
+            await asyncio.sleep(300)
+            now = datetime.now()
+            async with db_pool.acquire() as conn:
+                ads = await conn.fetch("SELECT * FROM ads WHERE enabled = TRUE")
+                for ad in ads:
+                    last_sent = ad['last_sent']
+                    interval = ad['interval_minutes']
+                    if last_sent:
+                        try:
+                            last = datetime.strptime(last_sent, "%Y-%m-%d %H:%M:%S.%f")
+                        except:
+                            last = datetime.strptime(last_sent, "%Y-%m-%d %H:%M:%S")
+                        if (now - last).total_seconds() < interval * 60:
+                            continue
+
+                    # Определяем целевую аудиторию
+                    target = ad['target']
+                    recipients = []
+
+                    if target in ('chats', 'all'):
+                        confirmed = await get_confirmed_chats()
+                        for chat_id in confirmed.keys():
+                            recipients.append(('chat', chat_id))
+                    if target in ('private', 'all'):
+                        async with db_pool.acquire() as conn2:
+                            users = await conn2.fetch("SELECT user_id FROM users")
+                            for u in users:
+                                recipients.append(('user', u['user_id']))
+
+                    # Отправляем
+                    sent_count = 0
+                    for typ, dest in recipients:
+                        try:
+                            if typ == 'chat':
+                                await bot.send_message(dest, ad['text'])
+                            else:
+                                await safe_send_message(dest, ad['text'])
+                            sent_count += 1
+                        except:
+                            pass
+                        await asyncio.sleep(0.05)  # небольшая задержка
+
+                    # Обновляем время последней отправки
+                    await conn.execute("UPDATE ads SET last_sent = $1 WHERE id = $2", now, ad['id'])
+                    logging.info(f"Ad {ad['id']} sent to {sent_count} recipients")
+
+        except Exception as e:
+            logging.error(f"Error in ad_sender: {e}")
+            await asyncio.sleep(60)
+
+# ==================== ПЕРИОДИЧЕСКАЯ ОЧИСТКА СТАРЫХ ЗАПИСЕЙ ====================
+async def periodic_cleanup():
+    """
+    Раз в сутки запускает очистку старых записей.
+    """
+    while True:
+        try:
+            await asyncio.sleep(86400)  # 24 часа
+            await perform_cleanup(manual=False)
+        except Exception as e:
+            logging.error(f"Error in periodic_cleanup: {e}")
+            await asyncio.sleep(3600)
+
+# ==================== ЗАПУСК БОТА ====================
+async def on_startup(dp):
+    logging.info("Бот запущен!")
+
+async def on_shutdown(dp):
+    await db_pool.close()
+    logging.info("Бот остановлен, соединения закрыты.")
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    # Создаём пул соединений
+    loop.run_until_complete(create_db_pool())
+    # Инициализируем таблицы
+    loop.run_until_complete(init_db())
+
+    # Запускаем фоновые задачи
+    loop.create_task(process_smuggle_runs())
+    loop.create_task(check_auctions())
+    loop.create_task(boss_spawn_scheduler())
+    loop.create_task(ad_sender())
+    loop.create_task(periodic_cleanup())
+
+    # Запускаем поллинг
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
