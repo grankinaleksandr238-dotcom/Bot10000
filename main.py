@@ -5810,9 +5810,7 @@ async def reject_chat_callback(callback: types.CallbackQuery):
     await callback.answer()
     # ==================== ПОЛНЫЙ РАБОЧИЙ БОТ (НОВАЯ ВЕРСИЯ) ====================
 # Часть 6: Фоновые задачи, очистка данных, точка входа, веб-сервер, запуск бота
-# ==================== ИСПРАВЛЕНО: добавлена функция add_auto_delete_field ====================
-# - Добавлено определение функции add_auto_delete_field
-# - Все остальные функции инициализации сохранены
+# ==================== ИСПРАВЛЕНО: добавлены все недостающие функции ====================
 
 # ==================== ФУНКЦИЯ ДЛЯ ДОБАВЛЕНИЯ ПОЛЯ АВТОУДАЛЕНИЯ ====================
 async def add_auto_delete_field():
@@ -5823,6 +5821,81 @@ async def add_auto_delete_field():
             logging.info("✅ Поле auto_delete_enabled добавлено в таблицу confirmed_chats")
         except Exception as e:
             logging.error(f"Ошибка при добавлении поля auto_delete_enabled: {e}")
+
+# ==================== ДОБАВЛЕНИЕ НЕДОСТАЮЩИХ КОЛОНОК ====================
+async def add_missing_user_columns():
+    """Добавляет недостающие колонки в таблицу users, если их нет."""
+    async with db_pool.acquire() as conn:
+        required_columns = [
+            ("global_authority", "INTEGER DEFAULT 0"),
+            ("multiplayer_wins", "INTEGER DEFAULT 0"),
+            ("multiplayer_losses", "INTEGER DEFAULT 0"),
+        ]
+        for col_name, col_def in required_columns:
+            try:
+                await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
+                logging.info(f"✅ Колонка {col_name} добавлена/проверена")
+            except Exception as e:
+                logging.error(f"Ошибка при добавлении колонки {col_name}: {e}")
+
+# ==================== ФУНКЦИИ ДЛЯ КОНТРАБАНДЫ ====================
+async def add_smuggle_columns():
+    """Добавляет поля для контрабанды в таблицу users, если их нет."""
+    async with db_pool.acquire() as conn:
+        required_columns = [
+            ("smuggle_goods", "INTEGER DEFAULT 0"),
+            ("smuggle_success", "INTEGER DEFAULT 0"),
+            ("smuggle_fail", "INTEGER DEFAULT 0"),
+        ]
+        for col_name, col_def in required_columns:
+            try:
+                await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
+                logging.info(f"✅ Колонка {col_name} добавлена/проверена")
+            except Exception as e:
+                logging.error(f"Ошибка при добавлении колонки {col_name}: {e}")
+
+async def create_smuggle_tables():
+    """Создаёт таблицы для контрабанды и бизнеса, если их нет."""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS smuggle_runs (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                start_time TIMESTAMP NOT NULL DEFAULT NOW(),
+                end_time TIMESTAMP NOT NULL,
+                status TEXT DEFAULT 'in_progress',
+                result TEXT,
+                smuggle_amount INTEGER DEFAULT 0,
+                notified BOOLEAN DEFAULT FALSE
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS business_types (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                cost_smuggle INTEGER NOT NULL,
+                income_per_hour INTEGER NOT NULL,
+                max_storage INTEGER NOT NULL,
+                required_authority INTEGER DEFAULT 0
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_businesses (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                business_type_id INTEGER REFERENCES business_types(id),
+                level INTEGER DEFAULT 1,
+                last_collection TIMESTAMP,
+                accumulated INTEGER DEFAULT 0,
+                UNIQUE(user_id, business_type_id)
+            )
+        ''')
+        # Индексы
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smuggle_runs_user ON smuggle_runs(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smuggle_runs_end ON smuggle_runs(end_time)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_businesses_user ON user_businesses(user_id)")
+    logging.info("✅ Таблицы для контрабанды и бизнеса созданы/проверены")
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ТИПОВ БИЗНЕСОВ ====================
 async def init_business_types():
@@ -6045,3 +6118,4 @@ if __name__ == "__main__":
             logging.error(f"Критическая ошибка: {e}")
             time.sleep(5)
             continue
+    
