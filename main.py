@@ -8012,7 +8012,6 @@ async def finish_game(game_id: str):
         await conn.execute("DELETE FROM multiplayer_games WHERE game_id=$1", game_id)
 
 @dp.message_handler(state=RoomChat.message)
-async defames WHERE game_id=$1", game_id)
 
 @dp.message_handler(state=RoomChat.message)
 async def room_chat_message room_chat_message(message: types.Message(message: types.Message, state: FSMContext):
