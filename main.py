@@ -1094,6 +1094,34 @@ async def init_db():
                 notified BOOLEAN DEFAULT FALSE
             )
         ''')
+                # Контрабандные рейсы
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS smuggle_runs (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                chat_id BIGINT,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                status TEXT DEFAULT 'in_progress',
+                result TEXT,
+                smuggle_amount INTEGER DEFAULT 0,
+                notified BOOLEAN DEFAULT FALSE
+            )
+        ''')
+
+        # ========== ВСТАВЬ ЭТОТ КОД СЮДА ==========
+        # Таблица кулдаунов контрабанды
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS smuggle_cooldowns (
+                user_id BIGINT PRIMARY KEY,
+                cooldown_until TIMESTAMP
+            )
+        ''')
+        # =========================================
+
+        # Индексы для ускорения
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC)")
+        # ... остальные индексы
 
         # Индексы для ускорения
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC)")
