@@ -5139,8 +5139,1321 @@ async def auction_list_back(callback: types.CallbackQuery):
     await callback.answer()
 
 # ==================== КОНЕЦ ЧАСТИ 4 ====================
+# ==================== ЧАСТЬ 5: БИЗНЕСЫ, РОЗЫГРЫШИ, БИТКОИН-БИРЖА (ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ) ====================
 
-```python
+# ==================== БИЗНЕСЫ ====================
+
+# Функция для периодического обновления дохода (запускается в фоне)
+async def update_all_businesses_income():
+    """Фоновая задача: каждый час начисляет доход всем бизнесам."""
+    while True:
+        await asyncio.sleep(3600)  # 1 час
+        try:
+            async with db_pool.acquire() as conn:
+                # Получаем все бизнесы с их типом
+                businesses = await conn.fetch("""
+                    SELECT ub.*, bt.base_income_cents 
+                    FROM user_businesses ub
+                    JOIN business_types bt ON ub.business_type_id = bt.id
+                """)
+                for biz in businesses:
+                    income_per_hour = biz['base_income_cents'] * biz['level']
+                    new_accum = biz['accumulated'] + income_per_hour
+                    await conn.execute(
+                        "UPDATE user_businesses SET accumulated = $1 WHERE id = $2",
+                        new_accum, biz['id']
+                    )
+                logging.info("Автоматическое начисление дохода по бизнесам выполнено.")
+        except Exception as e:
+            logging.error(f"Ошибка в update_all_businesses_income: {e}")
+
+@dp.message_handler(lambda message: message.text == "🏪 Мои бизнесы")
+async def my_businesses(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if await is_banned(user_id) and not await is_admin(user_id):
+        return
+    await ensure_user_exists(user_id, message.from_user.username, message.from_user.first_name)
+    ok, not_subscribed = await check_subscription(user_id)
+    if not ok:
+        await message.answer("❗️ Сначала подпишись на каналы.", reply_markup=subscription_inline(not_subscribed))
+        return
+
+    # Обновляем доход (на всякий случай)
+    async with db_pool.acquire() as conn:
+        await update_business_income(user_id, conn)
+        businesses = await get_user_businesses(user_id)
+
+    if not businesses:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏪 Купить бизнес", callback_data="buy_business_menu")]
+        ])
+        await message.answer("📭 У тебя пока нет бизнеса. Хочешь купить за биткоины?", reply_markup=kb)
+        return
+
+    kb = business_main_keyboard(businesses)
+    await message.answer("🏪 Твои бизнесы:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data == "buy_business_menu")
+async def buy_business_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    all_types = await get_business_type_list(only_available=True)
+    async with db_pool.acquire() as conn:
+        owned = await conn.fetch("SELECT business_type_id FROM user_businesses WHERE user_id=$1", user_id)
+        owned_ids = [r['business_type_id'] for r in owned]
+    available = [bt for bt in all_types if bt['id'] not in owned_ids]
+    if not available:
+        await callback.answer("Ты уже купил все доступные бизнесы!", show_alert=True)
+        return
+    kb = business_buy_keyboard(available)
+    await callback.message.edit_text("Выбери бизнес для покупки:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("buy_biz_"))
+async def buy_business_choose(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "buy_biz_cancel":
+        await callback.message.delete()
+        await callback.answer()
+        return
+    biz_type_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    biz_type = await get_business_type(biz_type_id)
+    if not biz_type:
+        await callback.answer("Бизнес не найден.", show_alert=True)
+        return
+    if not biz_type.get('available', True):
+        await callback.answer("Этот бизнес временно недоступен для покупки.", show_alert=True)
+        return
+    existing = await get_user_business(user_id, biz_type_id)
+    if existing:
+        await callback.answer("У тебя уже есть такой бизнес!", show_alert=True)
+        return
+    price = float(biz_type['base_price_btc'])
+    btc_balance = await get_user_bitcoin(user_id)
+    if btc_balance < price - 0.0001:
+        await callback.answer(f"Недостаточно биткоинов. Нужно {price:.2f} BTC, у тебя {btc_balance:.4f}.", show_alert=True)
+        return
+    await state.update_data(biz_type_id=biz_type_id, price=price, biz_name=biz_type['name'], biz_emoji=biz_type['emoji'])
+    await callback.message.answer(f"Ты уверен, что хочешь купить бизнес «{biz_type['emoji']} {biz_type['name']}» за {price:.2f} BTC? (да/нет)", reply_markup=back_keyboard())
+    await BuyBusiness.confirming.set()
+    await callback.answer()
+
+@dp.message_handler(state=BuyBusiness.confirming)
+async def buy_business_confirm(message: types.Message, state: FSMContext):
+    if message.text.lower() == 'нет' or message.text == "◀️ Назад":
+        await state.finish()
+        await my_businesses(message)
+        return
+    if message.text.lower() == 'да':
+        data = await state.get_data()
+        biz_type_id = data['biz_type_id']
+        price = data['price']
+        biz_name = data['biz_name']
+        user_id = message.from_user.id
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    btc = await get_user_bitcoin(user_id)
+                    if btc < price - 0.0001:
+                        await message.answer("❌ Недостаточно биткоинов.")
+                        await state.finish()
+                        return
+                    await update_user_bitcoin(user_id, -price, conn=conn)
+                    await create_user_business(user_id, biz_type_id)
+            phrase = get_random_phrase(BUSINESS_BUY_PHRASES, name=biz_name)
+            await message.answer(f"✅ {phrase}", reply_markup=main_menu_keyboard(await is_admin(user_id)))
+        except Exception as e:
+            logging.error(f"Buy business error: {e}")
+            await message.answer("❌ Ошибка при покупке бизнеса.")
+        await state.finish()
+    else:
+        await message.answer("Введи 'да' или 'нет'.")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("biz_view_"))
+async def business_view(callback: types.CallbackQuery):
+    biz_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        await update_business_income(user_id, conn)
+        biz = await conn.fetchrow("""
+            SELECT ub.*, bt.name, bt.emoji, bt.base_price_btc, bt.base_income_cents, bt.max_level
+            FROM user_businesses ub
+            JOIN business_types bt ON ub.business_type_id = bt.id
+            WHERE ub.id = $1 AND ub.user_id = $2
+        """, biz_id, user_id)
+        if not biz:
+            await callback.answer("Бизнес не найден", show_alert=True)
+            return
+    accum_bucks = biz['accumulated'] // 100
+    accum_cents = biz['accumulated'] % 100
+    income_per_hour = biz['base_income_cents'] * biz['level']
+    income_bucks = income_per_hour // 100
+    income_cents = income_per_hour % 100
+    upgrade_cost = await get_business_price({'base_price_btc': biz['base_price_btc']}, biz['level'] + 1) if biz['level'] < biz['max_level'] else 0
+    text = (
+        f"{biz['emoji']} <b>{biz['name']}</b> (ур. {biz['level']}/{biz['max_level']})\n\n"
+        f"📈 Доход в час: {income_bucks} баксов {income_cents} центов\n"
+        f"💰 Накоплено: {accum_bucks} баксов {accum_cents} центов\n"
+    )
+    if biz['level'] < biz['max_level']:
+        text += f"⬆️ Стоимость улучшения до ур.{biz['level']+1}: {upgrade_cost:.2f} BTC"
+    else:
+        text += "✅ Бизнес максимального уровня."
+    await callback.message.edit_text(text, reply_markup=business_actions_keyboard(biz_id))
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("biz_collect_"))
+async def business_collect(callback: types.CallbackQuery):
+    biz_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    success, result = await collect_business_income(user_id, biz_id)
+    if success:
+        await callback.answer(f"✅ {result}", show_alert=True)
+    else:
+        await callback.answer(f"❌ {result}", show_alert=True)
+    # Обновляем отображение
+    await business_view(callback)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("biz_upgrade_"))
+async def business_upgrade(callback: types.CallbackQuery, state: FSMContext):
+    biz_id = int(callback.data.split("_")[2])
+    await state.update_data(biz_id=biz_id)
+    await callback.message.answer("Ты уверен, что хочешь улучшить бизнес? (да/нет)", reply_markup=back_keyboard())
+    await UpgradeBusiness.confirming.set()
+    await callback.answer()
+
+@dp.message_handler(state=UpgradeBusiness.confirming)
+async def upgrade_confirm(message: types.Message, state: FSMContext):
+    if message.text.lower() == 'нет' or message.text == "◀️ Назад":
+        await state.finish()
+        await my_businesses(message)
+        return
+    if message.text.lower() == 'да':
+        data = await state.get_data()
+        biz_id = data['biz_id']
+        user_id = message.from_user.id
+        success, msg = await upgrade_business(user_id, biz_id)
+        await message.answer(msg)
+        await state.finish()
+        await my_businesses(message)
+    else:
+        await message.answer("Введи 'да' или 'нет'.")
+
+@dp.callback_query_handler(lambda c: c.data == "biz_back")
+async def business_back(callback: types.CallbackQuery):
+    await my_businesses(callback.message)
+    await callback.answer()
+
+# ==================== РОЗЫГРЫШИ (ОБЪЕДИНЕННЫЙ ХЕНДЛЕР С ПРОВЕРКОЙ ПРАВ) ====================
+
+@dp.message_handler(lambda message: message.text == "🎁 Розыгрыши")
+async def giveaways_unified_handler(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if await is_banned(user_id) and not await is_admin(user_id):
+        return
+    await ensure_user_exists(user_id, message.from_user.username, message.from_user.first_name)
+    ok, not_subscribed = await check_subscription(user_id)
+    if not ok:
+        await message.answer("❗️ Сначала подпишись на каналы.", reply_markup=subscription_inline(not_subscribed))
+        return
+
+    # Если админ и имеет права на управление розыгрышами, показываем админ-меню
+    if await has_permission(user_id, "manage_giveaways"):
+        await admin_giveaway_menu(message)
+    else:
+        await user_giveaways_menu(message)
+
+async def user_giveaways_menu(message: types.Message):
+    """Пользовательское меню розыгрышей."""
+    await message.answer("🎁 Розыгрыши:", reply_markup=giveaways_user_keyboard())
+
+@dp.message_handler(lambda message: message.text == "📋 Активные розыгрыши")
+async def active_giveaways_user(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if await is_banned(user_id) and not await is_admin(user_id):
+        return
+    page = 1
+    try:
+        parts = message.text.split()
+        if len(parts) > 1:
+            page = int(parts[1])
+    except:
+        pass
+    offset = (page - 1) * ITEMS_PER_PAGE
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM giveaways WHERE status='active'")
+        rows = await conn.fetch(
+            "SELECT id, prize, description, end_date FROM giveaways WHERE status='active' ORDER BY end_date LIMIT $1 OFFSET $2",
+            ITEMS_PER_PAGE, offset
+        )
+    if not rows:
+        await message.answer("Нет активных розыгрышей.")
+        return
+    text = f"📋 Активные розыгрыши (страница {page}):\n\n"
+    for row in rows:
+        text += f"🎁 #{row['id']} - {row['prize']}\n"
+        text += f"{row['description']}\n"
+        text += f"⏳ Окончание: {row['end_date']}\n\n"
+    total_pages = (total + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+    kb = active_giveaways_keyboard(rows, page, total_pages)
+    await message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("active_gw_") and not c.data.startswith("active_gw_page_"))
+async def active_giveaway_detail(callback: types.CallbackQuery):
+    gw_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        gw = await conn.fetchrow("SELECT * FROM giveaways WHERE id=$1 AND status='active'", gw_id)
+        if not gw:
+            await callback.answer("Розыгрыш не найден или уже завершён.", show_alert=True)
+            return
+        participant = await conn.fetchval("SELECT 1 FROM participants WHERE user_id=$1 AND giveaway_id=$2", user_id, gw_id)
+    text = (
+        f"🎁 <b>{gw['prize']}</b>\n"
+        f"📝 {gw['description']}\n"
+        f"⏳ Окончание: {gw['end_date']}\n"
+        f"👥 Победителей: {gw['winners_count']}\n"
+    )
+    kb = giveaway_detail_keyboard(gw_id, bool(participant))
+    if gw['media_file_id'] and gw['media_type'] == 'photo':
+        await callback.message.delete()
+        await callback.message.answer_photo(gw['media_file_id'], caption=text, reply_markup=kb)
+    else:
+        await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("join_giveaway_"))
+async def join_giveaway(callback: types.CallbackQuery):
+    gw_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        status = await conn.fetchval("SELECT status FROM giveaways WHERE id=$1", gw_id)
+        if status != 'active':
+            await callback.answer("Розыгрыш уже завершён.", show_alert=True)
+            return
+        exists = await conn.fetchval("SELECT 1 FROM participants WHERE user_id=$1 AND giveaway_id=$2", user_id, gw_id)
+        if exists:
+            await callback.answer("Ты уже участвуешь.", show_alert=True)
+            return
+        await conn.execute("INSERT INTO participants (user_id, giveaway_id) VALUES ($1, $2)", user_id, gw_id)
+    await callback.answer("✅ Ты участвуешь в розыгрыше!", show_alert=True)
+    await active_giveaway_detail(callback)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("leave_giveaway_"))
+async def leave_giveaway(callback: types.CallbackQuery):
+    gw_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM participants WHERE user_id=$1 AND giveaway_id=$2", user_id, gw_id)
+    await callback.answer("❌ Ты отказался от участия.", show_alert=True)
+    await active_giveaway_detail(callback)
+
+@dp.callback_query_handler(lambda c: c.data == "active_gw_back")
+async def active_gw_back(callback: types.CallbackQuery):
+    await active_giveaways_user(callback.message)
+    await callback.answer()
+
+@dp.message_handler(lambda message: message.text == "🏁 Завершённые розыгрыши")
+async def completed_giveaways_user(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if await is_banned(user_id) and not await is_admin(user_id):
+        return
+    page = 1
+    try:
+        parts = message.text.split()
+        if len(parts) > 1:
+            page = int(parts[1])
+    except:
+        pass
+    offset = (page - 1) * ITEMS_PER_PAGE
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM giveaways WHERE status='completed'")
+        rows = await conn.fetch(
+            "SELECT id, prize, description, end_date, winners_list FROM giveaways WHERE status='completed' ORDER BY end_date DESC LIMIT $1 OFFSET $2",
+            ITEMS_PER_PAGE, offset
+        )
+    if not rows:
+        await message.answer("Нет завершённых розыгрышей.")
+        return
+    text = f"🏁 Завершённые розыгрыши (страница {page}):\n\n"
+    for row in rows:
+        text += f"🎁 #{row['id']} - {row['prize']}\n"
+        text += f"📅 Завершён: {row['end_date']}\n"
+        text += f"👑 Победители: {row['winners_list'] or 'не указаны'}\n\n"
+    total_pages = (total + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+    kb = completed_giveaways_keyboard(rows, page, total_pages)
+    await message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("completed_gw_") and not c.data.startswith("completed_gw_page_"))
+async def completed_giveaway_detail(callback: types.CallbackQuery):
+    gw_id = int(callback.data.split("_")[2])
+    async with db_pool.acquire() as conn:
+        gw = await conn.fetchrow("SELECT * FROM giveaways WHERE id=$1 AND status='completed'", gw_id)
+        if not gw:
+            await callback.answer("Розыгрыш не найден.", show_alert=True)
+            return
+        participants = await conn.fetch("SELECT user_id FROM participants WHERE giveaway_id=$1", gw_id)
+    participants_list = "\n".join([f"• {p['user_id']}" for p in participants]) or "нет участников"
+    text = (
+        f"🏁 Розыгрыш #{gw['id']}\n"
+        f"🎁 Приз: {gw['prize']}\n"
+        f"📄 Описание: {gw['description']}\n"
+        f"📅 Дата окончания: {gw['end_date']}\n"
+        f"👑 Победители: {gw['winners_list'] or 'неизвестно'}\n\n"
+        f"📋 Участники:\n{participants_list}"
+    )
+    if gw['media_file_id'] and gw['media_type'] == 'photo':
+        await callback.message.delete()
+        await callback.message.answer_photo(gw['media_file_id'], caption=text)
+    else:
+        await callback.message.edit_text(text)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("completed_gw_page_"))
+async def completed_gw_page_callback(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[3])
+    callback.message.text = f"🏁 Завершённые розыгрыши {page}"
+    await completed_giveaways_user(callback.message)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "completed_gw_back")
+async def completed_gw_back(callback: types.CallbackQuery):
+    await completed_giveaways_user(callback.message)
+    await callback.answer()
+
+# ==================== БИТКОИН-БИРЖА (ПОЛНОЦЕННЫЙ СТАКАН) ====================
+
+@dp.message_handler(lambda message: message.text == "💼 Биткоин-биржа")
+async def bitcoin_exchange_menu(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if await is_banned(user_id) and not await is_admin(user_id):
+        return
+    await ensure_user_exists(user_id, message.from_user.username, message.from_user.first_name)
+    ok, not_subscribed = await check_subscription(user_id)
+    if not ok:
+        await message.answer("❗️ Сначала подпишись на каналы.", reply_markup=subscription_inline(not_subscribed))
+        return
+    await message.answer("💼 Биткоин-биржа: продавай и покупай BTC за баксы.", reply_markup=bitcoin_exchange_keyboard())
+
+# ----- Просмотр стакана заявок -----
+@dp.message_handler(lambda message: message.text == "📊 Стакан заявок")
+async def exchange_order_book(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    book = await get_order_book()
+    text = "📊 <b>Биржевой стакан</b>\n\n"
+    text += "📉 <b>Продажа (ASK)</b>:\n"
+    if book['asks']:
+        for ask in book['asks'][:10]:
+            text += f"• {ask['price']} $ | {ask['total_amount']:.4f} BTC ({ask['count']} заявок)\n"
+    else:
+        text += "Нет активных заявок на продажу.\n"
+    text += "\n📈 <b>Покупка (BID)</b>:\n"
+    if book['bids']:
+        for bid in book['bids'][:10]:
+            text += f"• {bid['price']} $ | {bid['total_amount']:.4f} BTC ({bid['count']} заявок)\n"
+    else:
+        text += "Нет активных заявок на покупку.\n"
+    text += "\nВыбери действие ниже:"
+    await message.answer(text, reply_markup=order_book_keyboard(book))
+
+@dp.callback_query_handler(lambda c: c.data.startswith("buy_from_"))
+async def buy_from_price(callback: types.CallbackQuery, state: FSMContext):
+    price = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    # Ищем все активные заявки на продажу по этой цене
+    async with db_pool.acquire() as conn:
+        orders = await conn.fetch(
+            "SELECT * FROM bitcoin_orders WHERE type='sell' AND status='active' AND price=$1 ORDER BY created_at ASC",
+            price
+        )
+    if not orders:
+        await callback.answer("Заявок по этой цене больше нет.", show_alert=True)
+        return
+    total_available = sum(o['amount'] for o in orders)
+    await state.update_data(price=price, orders=[dict(o) for o in orders], total_available=total_available)
+    await callback.message.answer(
+        f"📉 Продажа по цене {price} $/BTC. Доступно всего: {total_available:.4f} BTC.\n"
+        f"Введи количество BTC, которое хочешь купить (можно дробное):",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state("buy_from_price_amount")
+    await callback.answer()
+
+@dp.message_handler(state="buy_from_price_amount")
+async def buy_from_price_amount(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await bitcoin_exchange_menu(message)
+        return
+    try:
+        amount = float(message.text)
+        if amount <= 0:
+            raise ValueError
+        amount = round(amount, 4)
+    except:
+        await message.answer("❌ Введи положительное число.")
+        return
+    data = await state.get_data()
+    price = data['price']
+    orders = data['orders']
+    total_available = data['total_available']
+    if amount > total_available + 0.0001:
+        await message.answer(f"❌ Недостаточно BTC для покупки. Доступно {total_available:.4f} BTC.")
+        return
+    user_id = message.from_user.id
+    total_cost = amount * price
+    balance = await get_user_balance(user_id)
+    if balance < total_cost:
+        await message.answer(f"❌ Недостаточно баксов. Нужно {total_cost:.2f}.")
+        return
+    # Исполняем покупку, снимая с ордеров по очереди
+    remaining = amount
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            for order in orders:
+                if remaining <= 0.0001:
+                    break
+                order_id = order['id']
+                seller_id = order['user_id']
+                order_amount = order['amount']
+                take = min(remaining, order_amount)
+                # Проверяем, что ордер ещё активен
+                current = await conn.fetchrow("SELECT * FROM bitcoin_orders WHERE id=$1 AND status='active'", order_id)
+                if not current or current['amount'] < take - 0.0001:
+                    continue  # ордер изменился, пропускаем
+                # Обновляем балансы
+                await update_user_balance(user_id, -take * price, conn=conn)
+                await update_user_bitcoin(user_id, take, conn=conn)
+                await update_user_balance(seller_id, take * price, conn=conn)
+                # Обновляем ордер
+                new_amount = current['amount'] - take
+                new_locked = current['total_locked'] - take
+                if new_amount <= 0.0001:
+                    await conn.execute("UPDATE bitcoin_orders SET status='completed', amount=0, total_locked=0 WHERE id=$1", order_id)
+                else:
+                    await conn.execute("UPDATE bitcoin_orders SET amount=$1, total_locked=$2 WHERE id=$3", new_amount, new_locked, order_id)
+                # Записываем сделку
+                await conn.execute(
+                    "INSERT INTO bitcoin_trades (sell_order_id, amount, price, buyer_id, seller_id) VALUES ($1, $2, $3, $4, $5)",
+                    order_id, take, price, user_id, seller_id
+                )
+                remaining -= take
+    await message.answer(f"✅ Ты купил {amount:.4f} BTC за {total_cost:.2f} баксов.", reply_markup=bitcoin_exchange_keyboard())
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("sell_to_"))
+async def sell_to_price(callback: types.CallbackQuery, state: FSMContext):
+    price = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        orders = await conn.fetch(
+            "SELECT * FROM bitcoin_orders WHERE type='buy' AND status='active' AND price=$1 ORDER BY created_at ASC",
+            price
+        )
+    if not orders:
+        await callback.answer("Заявок по этой цене больше нет.", show_alert=True)
+        return
+    total_available = sum(o['amount'] for o in orders)
+    await state.update_data(price=price, orders=[dict(o) for o in orders], total_available=total_available)
+    await callback.message.answer(
+        f"📈 Покупка по цене {price} $/BTC. Требуется всего: {total_available:.4f} BTC.\n"
+        f"Введи количество BTC, которое хочешь продать (можно дробное):",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state("sell_to_price_amount")
+    await callback.answer()
+
+@dp.message_handler(state="sell_to_price_amount")
+async def sell_to_price_amount(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await bitcoin_exchange_menu(message)
+        return
+    try:
+        amount = float(message.text)
+        if amount <= 0:
+            raise ValueError
+        amount = round(amount, 4)
+    except:
+        await message.answer("❌ Введи положительное число.")
+        return
+    data = await state.get_data()
+    price = data['price']
+    orders = data['orders']
+    total_available = data['total_available']
+    if amount > total_available + 0.0001:
+        await message.answer(f"❌ Спрос меньше. Максимум можно продать {total_available:.4f} BTC.")
+        return
+    user_id = message.from_user.id
+    btc_balance = await get_user_bitcoin(user_id)
+    if btc_balance < amount:
+        await message.answer(f"❌ Недостаточно BTC. У тебя {btc_balance:.4f} BTC.")
+        return
+    total_profit = amount * price
+    # Исполняем продажу
+    remaining = amount
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            for order in orders:
+                if remaining <= 0.0001:
+                    break
+                order_id = order['id']
+                buyer_id = order['user_id']
+                order_amount = order['amount']
+                take = min(remaining, order_amount)
+                current = await conn.fetchrow("SELECT * FROM bitcoin_orders WHERE id=$1 AND status='active'", order_id)
+                if not current or current['amount'] < take - 0.0001:
+                    continue
+                await update_user_balance(user_id, take * price, conn=conn)
+                await update_user_bitcoin(user_id, -take, conn=conn)
+                await update_user_bitcoin(buyer_id, take, conn=conn)
+                new_amount = current['amount'] - take
+                new_locked = current['total_locked'] - take * price
+                if new_amount <= 0.0001:
+                    await conn.execute("UPDATE bitcoin_orders SET status='completed', amount=0, total_locked=0 WHERE id=$1", order_id)
+                else:
+                    await conn.execute("UPDATE bitcoin_orders SET amount=$1, total_locked=$2 WHERE id=$3", new_amount, new_locked, order_id)
+                await conn.execute(
+                    "INSERT INTO bitcoin_trades (buy_order_id, amount, price, buyer_id, seller_id) VALUES ($1, $2, $3, $4, $5)",
+                    order_id, take, price, buyer_id, user_id
+                )
+                remaining -= take
+    await message.answer(f"✅ Ты продал {amount:.4f} BTC за {total_profit:.2f} баксов.", reply_markup=bitcoin_exchange_keyboard())
+    await state.finish()
+
+# ----- Создание заявки на продажу -----
+@dp.message_handler(lambda message: message.text == "📉 Продать BTC")
+async def sell_bitcoin_start(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    btc_balance = await get_user_bitcoin(user_id)
+    min_amount = await get_setting_float("exchange_min_amount_btc")
+    await message.answer(
+        f"У тебя {btc_balance:.4f} BTC.\n"
+        f"Минимальная сумма заявки: {min_amount} BTC.\n"
+        f"Введи количество BTC, которое хочешь продать (можно дробное, например 0.5):",
+        reply_markup=back_keyboard()
+    )
+    await SellBitcoin.amount.set()
+
+@dp.message_handler(state=SellBitcoin.amount)
+async def sell_bitcoin_amount(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await bitcoin_exchange_menu(message)
+        return
+    try:
+        amount = float(message.text)
+        if amount <= 0:
+            raise ValueError
+        amount = round(amount, 4)
+    except ValueError:
+        await message.answer("❌ Введи положительное число (можно дробное).")
+        return
+    user_id = message.from_user.id
+    btc_balance = await get_user_bitcoin(user_id)
+    if btc_balance < amount - 0.0001:
+        await message.answer(f"❌ Недостаточно BTC. У тебя {btc_balance:.4f} BTC.")
+        return
+    min_amount = await get_setting_float("exchange_min_amount_btc")
+    if amount < min_amount:
+        await message.answer(f"❌ Минимальное количество для продажи: {min_amount} BTC.")
+        return
+    await state.update_data(amount=amount)
+    await message.answer("Введи цену в баксах за 1 BTC (целое число):")
+    await SellBitcoin.price.set()
+
+@dp.message_handler(state=SellBitcoin.price)
+async def sell_bitcoin_price(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await bitcoin_exchange_menu(message)
+        return
+    try:
+        price = int(message.text)
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи целое положительное число.")
+        return
+    min_price = await get_setting_int("exchange_min_price")
+    max_price = await get_setting_int("exchange_max_price")
+    if price < min_price:
+        await message.answer(f"❌ Цена не может быть меньше {min_price}.")
+        return
+    if max_price > 0 and price > max_price:
+        await message.answer(f"❌ Цена не может быть больше {max_price}.")
+        return
+    data = await state.get_data()
+    amount = data['amount']
+    user_id = message.from_user.id
+    try:
+        order_id = await create_bitcoin_order(user_id, 'sell', amount, price)
+        await message.answer(
+            f"✅ Заявка на продажу {amount:.4f} BTC по цене {price} $/BTC создана!\n"
+            f"ID заявки: {order_id}",
+            reply_markup=bitcoin_exchange_keyboard()
+        )
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+    except Exception as e:
+        logging.error(f"Sell bitcoin error: {e}")
+        await message.answer("❌ Ошибка при создании заявки.")
+    await state.finish()
+
+# ----- Создание заявки на покупку -----
+@dp.message_handler(lambda message: message.text == "📈 Купить BTC")
+async def buy_bitcoin_start(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    min_amount = await get_setting_float("exchange_min_amount_btc")
+    await message.answer(
+        f"Минимальная сумма заявки: {min_amount} BTC.\n"
+        f"Введи количество BTC, которое хочешь купить (можно дробное, например 0.5):",
+        reply_markup=back_keyboard()
+    )
+    await BuyBitcoin.amount.set()
+
+@dp.message_handler(state=BuyBitcoin.amount)
+async def buy_bitcoin_amount(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await bitcoin_exchange_menu(message)
+        return
+    try:
+        amount = float(message.text)
+        if amount <= 0:
+            raise ValueError
+        amount = round(amount, 4)
+    except ValueError:
+        await message.answer("❌ Введи положительное число (можно дробное).")
+        return
+    min_amount = await get_setting_float("exchange_min_amount_btc")
+    if amount < min_amount:
+        await message.answer(f"❌ Минимальное количество для покупки: {min_amount} BTC.")
+        return
+    await state.update_data(amount=amount)
+    await message.answer("Введи цену в баксах за 1 BTC (целое число):")
+    await BuyBitcoin.price.set()
+
+@dp.message_handler(state=BuyBitcoin.price)
+async def buy_bitcoin_price(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await bitcoin_exchange_menu(message)
+        return
+    try:
+        price = int(message.text)
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи целое положительное число.")
+        return
+    min_price = await get_setting_int("exchange_min_price")
+    max_price = await get_setting_int("exchange_max_price")
+    if price < min_price:
+        await message.answer(f"❌ Цена не может быть меньше {min_price}.")
+        return
+    if max_price > 0 and price > max_price:
+        await message.answer(f"❌ Цена не может быть больше {max_price}.")
+        return
+    data = await state.get_data()
+    amount = data['amount']
+    user_id = message.from_user.id
+    try:
+        order_id = await create_bitcoin_order(user_id, 'buy', amount, price)
+        await message.answer(
+            f"✅ Заявка на покупку {amount:.4f} BTC по цене {price} $/BTC создана!\n"
+            f"ID заявки: {order_id}",
+            reply_markup=bitcoin_exchange_keyboard()
+        )
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+    except Exception as e:
+        logging.error(f"Buy bitcoin error: {e}")
+        await message.answer("❌ Ошибка при создании заявки.")
+    await state.finish()
+
+# ----- Просмотр моих заявок -----
+@dp.message_handler(lambda message: message.text == "📋 Мои заявки")
+async def my_orders(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM bitcoin_orders WHERE user_id=$1 AND status='active' ORDER BY created_at DESC",
+            user_id
+        )
+    if not rows:
+        await message.answer("У тебя нет активных заявок.", reply_markup=bitcoin_exchange_keyboard())
+        return
+    # Разбивка по страницам
+    page = 1
+    total_pages = (len(rows) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+    start = (page - 1) * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    page_orders = [dict(r) for r in rows[start:end]]
+    kb = my_orders_keyboard(page_orders, page, total_pages)
+    await message.answer("Твои активные заявки:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("myorder_"))
+async def my_order_detail(callback: types.CallbackQuery):
+    order_id = int(callback.data.split("_")[1])
+    async with db_pool.acquire() as conn:
+        order = await conn.fetchrow("SELECT * FROM bitcoin_orders WHERE id=$1", order_id)
+    if not order or order['status'] != 'active':
+        await callback.answer("Заявка не найдена или уже не активна.", show_alert=True)
+        return
+    text = (
+        f"📄 Заявка #{order['id']}\n"
+        f"Тип: {'📈 Покупка' if order['type']=='buy' else '📉 Продажа'}\n"
+        f"Количество: {order['amount']:.4f} BTC\n"
+        f"Цена: {order['price']} $/BTC\n"
+        f"Всего: {order['amount'] * order['price']:.2f} $\n"
+        f"Создана: {order['created_at']}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить заявку", callback_data=f"cancel_order_{order_id}")],
+        [InlineKeyboardButton(text="« Назад", callback_data="my_orders_back")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cancel_order_"))
+async def cancel_order_callback(callback: types.CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    success = await cancel_bitcoin_order(order_id, user_id)
+    if success:
+        await callback.answer("✅ Заявка отменена, средства возвращены.", show_alert=True)
+    else:
+        await callback.answer("❌ Не удалось отменить заявку.", show_alert=True)
+    await my_orders(callback.message)
+
+@dp.callback_query_handler(lambda c: c.data == "my_orders_back")
+async def my_orders_back(callback: types.CallbackQuery):
+    await my_orders(callback.message)
+
+@dp.callback_query_handler(lambda c: c.data == "exchange_back")
+async def exchange_back(callback: types.CallbackQuery):
+    await bitcoin_exchange_menu(callback.message)
+    await callback.answer()
+
+# ==================== КОНЕЦ ЧАСТИ 5 ====================
+
+# ==================== ЧАСТЬ 6: МУЛЬТИПЛЕЕР (ИГРА 21) – ИСПРАВЛЕННЫЙ ====================
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ МУЛЬТИПЛЕЕРА ====================
+
+async def get_multiplayer_game(game_id: str) -> Optional[dict]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+        return dict(row) if row else None
+
+async def get_game_players(game_id: str) -> List[dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM game_players WHERE game_id=$1 ORDER BY joined_at", game_id)
+        return [dict(r) for r in rows]
+
+async def add_player_to_game(game_id: str, user_id: int, username: str):
+    async with db_pool.acquire() as conn:
+        game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1 AND status='waiting'", game_id)
+        if not game:
+            raise ValueError("Игра не найдена или уже началась")
+        players_count = await conn.fetchval("SELECT COUNT(*) FROM game_players WHERE game_id=$1", game_id)
+        if players_count >= game['max_players']:
+            raise ValueError("Комната уже полная")
+        await conn.execute(
+            "INSERT INTO game_players (game_id, user_id, username, cards, value, stopped, joined_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            game_id, user_id, username, '', 0, False, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+
+async def remove_player_from_game(game_id: str, user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM game_players WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+        remaining = await conn.fetchval("SELECT COUNT(*) FROM game_players WHERE game_id=$1", game_id)
+        if remaining == 0:
+            await conn.execute("DELETE FROM multiplayer_games WHERE game_id=$1", game_id)
+
+async def start_game(game_id: str):
+    """Раздаёт карты и начинает игру. Предварительно списывает ставки."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1 AND status='waiting'", game_id)
+            if not game:
+                raise ValueError("Игра не найдена или уже началась")
+            players = await conn.fetch("SELECT * FROM game_players WHERE game_id=$1 ORDER BY joined_at", game_id)
+            if len(players) < 2:
+                raise ValueError("Недостаточно игроков")
+            
+            # Проверяем баланс всех игроков
+            for player in players:
+                balance = await get_user_balance(player['user_id'])
+                if balance < game['bet_amount'] - 0.01:
+                    raise ValueError(f"У игрока {player['username']} недостаточно баксов")
+            
+            # Списываем ставки
+            for player in players:
+                await update_user_balance(player['user_id'], -game['bet_amount'], conn=conn)
+            
+            deck = create_deck()
+            deck_str = ','.join(deck)
+            for player in players:
+                cards = [deck.pop(), deck.pop()]
+                value = calculate_hand_value(cards)
+                await conn.execute(
+                    "UPDATE game_players SET cards=$1, value=$2 WHERE game_id=$3 AND user_id=$4",
+                    ','.join(cards), value, game_id, player['user_id']
+                )
+            await conn.execute(
+                "UPDATE multiplayer_games SET status='playing', deck=$1, current_player_index=0 WHERE game_id=$2",
+                deck_str, game_id
+            )
+            return game_id
+
+async def get_current_player(game_id: str) -> Optional[dict]:
+    async with db_pool.acquire() as conn:
+        game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+        if not game or game['status'] != 'playing':
+            return None
+        players = await conn.fetch("SELECT * FROM game_players WHERE game_id=$1 ORDER BY joined_at", game_id)
+        if not players:
+            return None
+        idx = game['current_player_index']
+        if idx >= len(players):
+            return None
+        return dict(players[idx])
+
+async def next_player(game_id: str) -> Optional[int]:
+    """Переходит к следующему игроку. Возвращает индекс следующего или -1, если игра закончена."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+            if not game:
+                return -1
+            players = await conn.fetch("SELECT * FROM game_players WHERE game_id=$1 ORDER BY joined_at", game_id)
+            if not players:
+                return -1
+            all_stopped = all(p['stopped'] or p['surrendered'] or p['value'] > 21 for p in players)
+            if all_stopped:
+                await finish_game(game_id)
+                return -1
+            current_idx = game['current_player_index']
+            next_idx = current_idx
+            for _ in range(len(players)):
+                next_idx = (next_idx + 1) % len(players)
+                p = players[next_idx]
+                if not p['stopped'] and not p['surrendered'] and p['value'] <= 21:
+                    await conn.execute("UPDATE multiplayer_games SET current_player_index=$1 WHERE game_id=$2", next_idx, game_id)
+                    return next_idx
+            await finish_game(game_id)
+            return -1
+
+async def finish_game(game_id: str):
+    """Определяет победителя и выплачивает выигрыш. Обновляет статистику."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+            if not game or game['status'] != 'playing':
+                return
+            players = await conn.fetch("SELECT * FROM game_players WHERE game_id=$1", game_id)
+            if not players:
+                await conn.execute("DELETE FROM multiplayer_games WHERE game_id=$1", game_id)
+                return
+            best_value = -1
+            winner_id = None
+            for p in players:
+                val = p['value']
+                if val <= 21 and val > best_value:
+                    best_value = val
+                    winner_id = p['user_id']
+            pot = game['bet_amount'] * len(players)
+            if winner_id:
+                # Победитель получает весь банк
+                await update_user_balance(winner_id, pot, conn=conn)
+                # Обновляем статистику
+                await update_user_game_stats(winner_id, 'multiplayer', win=True, conn=conn)
+                for p in players:
+                    if p['user_id'] != winner_id:
+                        await update_user_game_stats(p['user_id'], 'multiplayer', win=False, conn=conn)
+                exp_win = await get_setting_int("exp_per_game_win")
+                exp_lose = await get_setting_int("exp_per_game_lose")
+                await add_exp(winner_id, exp_win, conn=conn)
+                for p in players:
+                    if p['user_id'] != winner_id:
+                        await add_exp(p['user_id'], exp_lose, conn=conn)
+                # Уведомляем
+                for p in players:
+                    if p['user_id'] == winner_id:
+                        await safe_send_message(p['user_id'], f"🎉 Ты выиграл в игре 21! Твой выигрыш: {pot:.2f} баксов.")
+                    else:
+                        await safe_send_message(p['user_id'], f"😢 Ты проиграл в игре 21. Твоя ставка {game['bet_amount']:.2f} баксов потеряна.")
+            else:
+                # Ничья или все перебрали – возврат ставок
+                for p in players:
+                    await update_user_balance(p['user_id'], game['bet_amount'], conn=conn)
+                    await update_user_game_stats(p['user_id'], 'multiplayer', win=False, conn=conn)
+                    await add_exp(p['user_id'], await get_setting_int("exp_per_game_lose"), conn=conn)
+                    await safe_send_message(p['user_id'], f"🤝 В игре 21 ничья. Твоя ставка {game['bet_amount']:.2f} баксов возвращена.")
+            # Удаляем игру и игроков
+            await conn.execute("DELETE FROM multiplayer_games WHERE game_id=$1", game_id)
+            await conn.execute("DELETE FROM game_players WHERE game_id=$1", game_id)
+
+# ==================== ХЕНДЛЕРЫ МУЛЬТИПЛЕЕРА ====================
+
+@dp.message_handler(lambda message: message.text == "👥 Мультиплеер 21")
+async def multiplayer_menu(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if await is_banned(user_id) and not await is_admin(user_id):
+        return
+    await ensure_user_exists(user_id, message.from_user.username, message.from_user.first_name)
+    ok, not_subscribed = await check_subscription(user_id)
+    if not ok:
+        await message.answer("❗️ Сначала подпишись на каналы.", reply_markup=subscription_inline(not_subscribed))
+        return
+    min_level = await get_setting_int("min_level_multiplayer")
+    level = await get_user_level(user_id)
+    if level < min_level:
+        await message.answer(f"❌ Для игры в мультиплеер нужен {min_level} уровень. Твой уровень: {level}")
+        return
+    await message.answer("🎮 Мультиплеер 21 (очко)", reply_markup=multiplayer_lobby_keyboard())
+
+@dp.message_handler(lambda message: message.text == "➕ Создать комнату")
+async def create_room_start(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    await message.answer("Введи максимальное количество игроков (2-5):", reply_markup=back_keyboard())
+    await MultiplayerGame.create_max_players.set()
+
+@dp.message_handler(state=MultiplayerGame.create_max_players)
+async def create_room_max_players(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await multiplayer_menu(message)
+        return
+    try:
+        max_players = int(message.text)
+        if max_players < 2 or max_players > 5:
+            raise ValueError
+    except:
+        await message.answer("❌ Введи число от 2 до 5.")
+        return
+    await state.update_data(max_players=max_players)
+    await message.answer("Введи ставку (можно дробную, например 10.50):")
+    await MultiplayerGame.create_bet.set()
+
+@dp.message_handler(state=MultiplayerGame.create_bet)
+async def create_room_bet(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await multiplayer_menu(message)
+        return
+    try:
+        bet = float(message.text)
+        if bet <= 0:
+            raise ValueError
+        bet = round(bet, 2)
+    except ValueError:
+        await message.answer("❌ Введи положительное число с точностью до сотых.")
+        return
+    min_bet = await get_setting_float("multiplayer_min_bet")
+    max_bet = await get_setting_float("multiplayer_max_bet")
+    if bet < min_bet or bet > max_bet:
+        await message.answer(f"❌ Ставка должна быть от {min_bet:.2f} до {max_bet:.2f}.")
+        return
+    user_id = message.from_user.id
+    balance = await get_user_balance(user_id)
+    if balance < bet:
+        await message.answer("❌ Недостаточно баксов.")
+        return
+    data = await state.get_data()
+    max_players = data['max_players']
+    game_id = generate_game_id()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO multiplayer_games (game_id, host_id, max_players, bet_amount, status, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            game_id, user_id, max_players, bet, 'waiting', datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        await conn.execute(
+            "INSERT INTO game_players (game_id, user_id, username, cards, value, stopped, joined_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            game_id, user_id, message.from_user.username or "Player", '', 0, False, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+    await state.finish()
+    text = (
+        f"🎮 Комната {game_id} создана!\n"
+        f"Ставка: {bet:.2f} баксов\n"
+        f"Игроков: 1/{max_players}\n"
+        f"Поделись этим ID с друзьями, чтобы они присоединились."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Присоединиться", url=f"https://t.me/{(await bot.me).username}?start=join_{game_id}")],
+        [InlineKeyboardButton(text="❌ Закрыть комнату", callback_data=f"close_room_{game_id}")]
+    ])
+    await message.answer(text, reply_markup=kb)
+
+@dp.message_handler(lambda message: message.text == "🔍 Найти комнату")
+async def join_room_by_code(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    await message.answer("Введи код комнаты (например, ABC123):", reply_markup=back_keyboard())
+    await MultiplayerGame.join_code.set()
+
+@dp.message_handler(state=MultiplayerGame.join_code)
+async def join_room_code(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await multiplayer_menu(message)
+        return
+    game_id = message.text.strip().upper()
+    user_id = message.from_user.id
+    try:
+        game = await get_multiplayer_game(game_id)
+        if not game or game['status'] != 'waiting':
+            await message.answer("❌ Комната не найдена или уже началась.")
+            return
+        players = await get_game_players(game_id)
+        if len(players) >= game['max_players']:
+            await message.answer("❌ Комната уже полная.")
+            return
+        if any(p['user_id'] == user_id for p in players):
+            await message.answer("❌ Ты уже в этой комнате.")
+            return
+        balance = await get_user_balance(user_id)
+        if balance < game['bet_amount']:
+            await message.answer(f"❌ Недостаточно баксов для ставки {game['bet_amount']:.2f}.")
+            return
+        await add_player_to_game(game_id, user_id, message.from_user.username or "Player")
+        await message.answer(f"✅ Ты присоединился к комнате {game_id}.\nСтавка: {game['bet_amount']:.2f} баксов.\nОжидаем начала игры.")
+        host_id = game['host_id']
+        await safe_send_message(host_id, f"🔔 Новый игрок {message.from_user.first_name} присоединился к комнате {game_id}. Текущий состав: {len(players)+1}/{game['max_players']}")
+    except Exception as e:
+        logging.error(f"Join room error: {e}")
+        await message.answer("❌ Ошибка при присоединении.")
+    await state.finish()
+
+@dp.message_handler(lambda message: message.text == "📋 Список комнат")
+async def list_rooms(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM multiplayer_games WHERE status='waiting' ORDER BY created_at DESC LIMIT 10")
+    if not rows:
+        await message.answer("Нет открытых комнат.")
+        return
+    text = "📋 Открытые комнаты:\n\n"
+    for row in rows:
+        players = await get_game_players(row['game_id'])
+        text += f"🆔 {row['game_id']} | Ставка: {row['bet_amount']:.2f} | Игроков: {len(players)}/{row['max_players']}\n"
+    await message.answer(text, reply_markup=multiplayer_lobby_keyboard())
+
+@dp.callback_query_handler(lambda c: c.data.startswith("close_room_"))
+async def close_room_callback(callback: types.CallbackQuery):
+    game_id = callback.data.split("_")[2]
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+        if not game or game['host_id'] != user_id:
+            await callback.answer("❌ Только создатель может закрыть комнату.", show_alert=True)
+            return
+        await conn.execute("DELETE FROM multiplayer_games WHERE game_id=$1", game_id)
+        await conn.execute("DELETE FROM game_players WHERE game_id=$1", game_id)
+    await callback.message.edit_text("❌ Комната закрыта.")
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("start_game_"))
+async def start_game_callback(callback: types.CallbackQuery):
+    game_id = callback.data.split("_")[2]
+    user_id = callback.from_user.id
+    try:
+        game = await get_multiplayer_game(game_id)
+        if not game or game['host_id'] != user_id:
+            await callback.answer("❌ Только создатель может начать игру.", show_alert=True)
+            return
+        if game['status'] != 'waiting':
+            await callback.answer("❌ Игра уже началась.", show_alert=True)
+            return
+        players = await get_game_players(game_id)
+        if len(players) < 2:
+            await callback.answer("❌ Недостаточно игроков (минимум 2).", show_alert=True)
+            return
+        # Запускаем игру (списание ставок происходит внутри start_game)
+        await start_game(game_id)
+        for p in players:
+            await safe_send_message(p['user_id'], f"🎮 Игра {game_id} началась! Твой ход будет объявлен.")
+        await show_current_turn(game_id, callback.message)
+        await callback.message.delete()
+    except Exception as e:
+        logging.error(f"Start game error: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+async def show_current_turn(game_id: str, message: types.Message = None, user_id: int = None):
+    game = await get_multiplayer_game(game_id)
+    if not game or game['status'] != 'playing':
+        return
+    current_player = await get_current_player(game_id)
+    if not current_player:
+        return
+    players = await get_game_players(game_id)
+    text = f"🎮 Игра {game_id}\n\n"
+    for p in players:
+        cards = p['cards'].split(',') if p['cards'] else []
+        card_str = ' '.join(cards) if cards else '❓'
+        status = "✅" if p['stopped'] else "⏳" if p['user_id'] == current_player['user_id'] else "⏸️"
+        if p['surrendered']:
+            status = "🏳️"
+        elif p['value'] > 21:
+            status = "💥"
+        text += f"{status} {p['username']}: {card_str} = {p['value'] if p['value']>0 else '?'}\n"
+    text += f"\n💰 Твоя ставка: {game['bet_amount']:.2f} баксов"
+    kb = room_action_keyboard(can_double=not current_player['doubled'])
+    if user_id:
+        await bot.send_message(user_id, text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data in ["room_hit", "room_stand", "room_double", "room_surrender", "room_chat"])
+async def room_action_callback(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        game_row = await conn.fetchrow("""
+            SELECT g.* FROM multiplayer_games g
+            JOIN game_players p ON g.game_id = p.game_id
+            WHERE p.user_id=$1 AND g.status='playing'
+        """, user_id)
+    if not game_row:
+        await callback.answer("❌ Ты не участвуешь в активной игре.", show_alert=True)
+        return
+    game_id = game_row['game_id']
+    action = callback.data.split("_")[1] if "_" in callback.data else callback.data
+    current = await get_current_player(game_id)
+    if not current or current['user_id'] != user_id:
+        await callback.answer("❌ Сейчас не твой ход.", show_alert=True)
+        return
+    
+    if action == "hit":
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+                deck = game['deck'].split(',')
+                if not deck:
+                    await callback.answer("❌ Колода закончилась!", show_alert=True)
+                    return
+                card = deck.pop()
+                new_deck = ','.join(deck)
+                player = await conn.fetchrow("SELECT * FROM game_players WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+                cards = player['cards'].split(',') if player['cards'] else []
+                cards.append(card)
+                value = calculate_hand_value(cards)
+                await conn.execute(
+                    "UPDATE game_players SET cards=$1, value=$2 WHERE game_id=$3 AND user_id=$4",
+                    ','.join(cards), value, game_id, user_id
+                )
+                await conn.execute("UPDATE multiplayer_games SET deck=$1 WHERE game_id=$2", new_deck, game_id)
+                if value > 21:
+                    await conn.execute("UPDATE game_players SET stopped=TRUE WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+                    await next_player(game_id)
+        await callback.answer()
+        await show_current_turn(game_id, user_id=user_id)
+        
+    elif action == "stand":
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE game_players SET stopped=TRUE WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+            await next_player(game_id)
+        await callback.answer()
+        await show_current_turn(game_id, user_id=user_id)
+        
+    elif action == "double":
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                player = await conn.fetchrow("SELECT * FROM game_players WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+                if player['doubled']:
+                    await callback.answer("❌ Ты уже удваивал ставку.", show_alert=True)
+                    return
+                game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+                bet = game['bet_amount']
+                balance = await get_user_balance(user_id)
+                if balance < bet:
+                    await callback.answer("❌ Недостаточно баксов для удвоения.", show_alert=True)
+                    return
+                await update_user_balance(user_id, -bet, conn=conn)
+                await conn.execute("UPDATE game_players SET doubled=TRUE WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+                # после удвоения обычно берут одну карту и останавливаются
+                deck = game['deck'].split(',')
+                if deck:
+                    card = deck.pop()
+                    new_deck = ','.join(deck)
+                    cards = player['cards'].split(',') if player['cards'] else []
+                    cards.append(card)
+                    value = calculate_hand_value(cards)
+                    await conn.execute(
+                        "UPDATE game_players SET cards=$1, value=$2, stopped=TRUE WHERE game_id=$3 AND user_id=$4",
+                        ','.join(cards), value, game_id, user_id
+                    )
+                    await conn.execute("UPDATE multiplayer_games SET deck=$1 WHERE game_id=$2", new_deck, game_id)
+                else:
+                    await conn.execute("UPDATE game_players SET stopped=TRUE WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+                await next_player(game_id)
+        await callback.answer()
+        await show_current_turn(game_id, user_id=user_id)
+        
+    elif action == "surrender":
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE game_players SET surrendered=TRUE WHERE game_id=$1 AND user_id=$2", game_id, user_id)
+            await next_player(game_id)
+        await callback.answer()
+        await show_current_turn(game_id, user_id=user_id)
+        
+    elif action == "chat":
+        await callback.message.answer("💬 Введи сообщение для всех игроков комнаты (или /cancel для выхода):", reply_markup=cancel_keyboard())
+        await RoomChat.message.set()
+        await state.update_data(game_id=game_id)
+
+@dp.message_handler(state=RoomChat.message)
+async def room_chat_message(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.finish()
+        await multiplayer_menu(message)
+        return
+    data = await state.get_data()
+    game_id = data['game_id']
+    players = await get_game_players(game_id)
+    for p in players:
+        if p['user_id'] != message.from_user.id:
+            await safe_send_message(p['user_id'], f"💬 {message.from_user.first_name}: {message.text}")
+    await message.answer("✅ Сообщение отправлено всем игрокам комнаты.")
+    await state.finish()
+    await show_current_turn(game_id, user_id=message.from_user.id)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("leave_room_"))
+async def leave_room_callback(callback: types.CallbackQuery):
+    game_id = callback.data.split("_")[2]
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        game = await conn.fetchrow("SELECT * FROM multiplayer_games WHERE game_id=$1", game_id)
+        if game and game['status'] == 'waiting':
+            await remove_player_from_game(game_id, user_id)
+            await callback.answer("✅ Ты покинул комнату.")
+            await callback.message.delete()
+        else:
+            await callback.answer("❌ Нельзя покинуть комнату после начала игры.", show_alert=True)
+
+# ==================== КОНЕЦ ЧАСТИ 6 ====================
+
 # ==================== ЧАСТЬ 7: ГРУППОВЫЕ ХЕНДЛЕРЫ (КОМАНДЫ С ПРЕФИКСОМ /mlb_) ====================
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ГРУПП ====================
@@ -5844,6 +7157,185 @@ async def cmd_smuggle_chat(message: types.Message):
 async def check_admin_permissions(user_id: int, permission: str) -> bool:
     """Проверяет, есть ли у пользователя указанное право."""
     return await has_permission(user_id, permission)
+
+# ==================== КАТЕГОРИИ НАСТРОЕК ====================
+
+SETTINGS_CATEGORIES = {
+    "⚙️ Кража": [
+        ("random_attack_cost", "💰 Стоимость случайной кражи"),
+        ("targeted_attack_cost", "🎯 Стоимость целевой кражи"),
+        ("theft_cooldown_minutes", "⏳ Кулдаун кражи (минуты)"),
+        ("theft_success_chance", "✅ Шанс успеха кражи (%)"),
+        ("theft_defense_chance", "🛡 Шанс защиты жертвы (%)"),
+        ("theft_defense_penalty", "💸 Штраф при защите"),
+        ("min_theft_amount", "⬇️ Мин. сумма кражи"),
+        ("max_theft_amount", "⬆️ Макс. сумма кражи"),
+    ],
+    "⚙️ Казино и игры": [
+        ("casino_win_chance", "🎰 Шанс выигрыша в казино (%)"),
+        ("casino_min_bet", "🎰 Мин. ставка в казино"),
+        ("casino_max_bet", "🎰 Макс. ставка в казино"),
+        ("casino_multiplier", "🎰 Множитель выигрыша"),
+        ("dice_multiplier", "🎲 Множитель в костях"),
+        ("dice_win_threshold", "🎲 Порог победы (сумма костей)"),
+        ("guess_multiplier", "🔢 Множитель в угадайке"),
+        ("guess_reputation", "🔢 Репутация за победу"),
+        ("slots_multiplier_three", "🍒 Множитель 3 символа"),
+        ("slots_multiplier_diamond", "💎 Множитель бриллианты"),
+        ("slots_multiplier_seven", "7️⃣ Множитель семерки"),
+        ("slots_win_probability", "🍒 Шанс выигрыша в слотах (%)"),
+        ("slots_min_bet", "🍒 Мин. ставка в слотах"),
+        ("slots_max_bet", "🍒 Макс. ставка в слотах"),
+        ("roulette_color_multiplier", "🎡 Множитель на цвет"),
+        ("roulette_green_multiplier", "🎡 Множитель на зеленый"),
+        ("roulette_number_multiplier", "🎡 Множитель на число"),
+        ("roulette_min_bet", "🎡 Мин. ставка в рулетке"),
+        ("roulette_max_bet", "🎡 Макс. ставка в рулетке"),
+        ("multiplayer_min_bet", "👥 Мин. ставка в мультиплеере"),
+        ("multiplayer_max_bet", "👥 Макс. ставка в мультиплеере"),
+    ],
+    "⚙️ Ограничения по уровню": [
+        ("min_level_casino", "🎰 Мин. уровень для казино"),
+        ("min_level_dice", "🎲 Мин. уровень для костей"),
+        ("min_level_guess", "🔢 Мин. уровень для угадайки"),
+        ("min_level_slots", "🍒 Мин. уровень для слотов"),
+        ("min_level_roulette", "🎡 Мин. уровень для рулетки"),
+        ("min_level_multiplayer", "👥 Мин. уровень для мультиплеера"),
+    ],
+    "⚙️ Уведомления": [
+        ("chat_notify_big_win", "🔥 Уведомлять о крупных выигрышах (1/0)"),
+        ("chat_notify_big_purchase", "🛒 Уведомлять о крупных покупках (1/0)"),
+        ("chat_notify_giveaway", "🎁 Уведомлять о розыгрышах (1/0)"),
+    ],
+    "⚙️ Подгон": [
+        ("gift_amount", "🎁 Сумма подгона"),
+        ("gift_limit_per_day", "📊 Лимит подгонов в чате в день"),
+        ("gift_global_limit_per_user", "🌐 Глобальный лимит подгонов на пользователя"),
+        ("gift_cooldown", "⏳ Кулдаун подгона (минуты)"),
+    ],
+    "⚙️ Рефералы": [
+        ("referral_bonus", "💰 Бонус за реферала"),
+        ("referral_reputation", "⭐ Репутация за реферала"),
+        ("referral_required_thefts", "🔫 Требуется краж для активации"),
+    ],
+    "⚙️ Опыт и уровни": [
+        ("exp_per_casino_win", "🎰 Опыт за победу в казино"),
+        ("exp_per_casino_lose", "🎰 Опыт за проигрыш в казино"),
+        ("exp_per_dice_win", "🎲 Опыт за победу в кости"),
+        ("exp_per_dice_lose", "🎲 Опыт за проигрыш в кости"),
+        ("exp_per_guess_win", "🔢 Опыт за победу в угадайке"),
+        ("exp_per_guess_lose", "🔢 Опыт за проигрыш в угадайке"),
+        ("exp_per_slots_win", "🍒 Опыт за победу в слотах"),
+        ("exp_per_slots_lose", "🍒 Опыт за проигрыш в слотах"),
+        ("exp_per_roulette_win", "🎡 Опыт за победу в рулетке"),
+        ("exp_per_roulette_lose", "🎡 Опыт за проигрыш в рулетке"),
+        ("exp_per_theft_success", "🔫 Опыт за успешную кражу"),
+        ("exp_per_theft_fail", "🔫 Опыт за провал кражи"),
+        ("exp_per_theft_defense", "🛡 Опыт за защиту"),
+        ("exp_per_game_win", "👥 Опыт за победу в мультиплеере"),
+        ("exp_per_game_lose", "👥 Опыт за проигрыш в мультиплеере"),
+        ("exp_per_fight", "⚔️ Опыт за бой"),
+        ("exp_per_smuggle", "📦 Опыт за контрабанду"),
+        ("level_multiplier", "📊 Множитель опыта для уровня"),
+        ("level_reward_coins", "💰 База награды за уровень"),
+        ("level_reward_reputation", "⭐ База репутации за уровень"),
+        ("level_reward_coins_increment", "📈 Прирост баксов за уровень"),
+        ("level_reward_reputation_increment", "📈 Прирост репутации за уровень"),
+    ],
+    "⚙️ Репутация": [
+        ("reputation_theft_bonus", "🔫 Бонус репутации к краже (% за единицу)"),
+        ("reputation_defense_bonus", "🛡 Бонус репутации к защите (% за единицу)"),
+        ("reputation_smuggle_bonus", "📦 Бонус репутации к BTC (за единицу)"),
+        ("reputation_smuggle_success_bonus", "🚤 Бонус репутации к успеху контрабанды (% за единицу)"),
+        ("reputation_max_bonus_percent", "📊 Макс. бонус от репутации (%)"),
+    ],
+    "⚙️ Боссы": [
+        ("boss_spawn_chance", "🎲 Шанс спавна босса (%)"),
+        ("boss_min_interval", "⏳ Мин. интервал между спавнами (минуты)"),
+        ("boss_max_per_day", "📊 Макс. боссов в день на чат"),
+        ("boss_hp_multiplier", "❤️ Множитель HP"),
+        ("boss_attack_cooldown", "⏳ Кулдаун атаки (секунды)"),
+        ("boss_base_damage", "💥 База урона"),
+        ("boss_reward_coins", "💰 База награды баксами"),
+        ("boss_reward_coins_variance", "🎲 Вариация награды баксами"),
+        ("boss_reward_bitcoin", "₿ База награды BTC"),
+        ("boss_reward_bitcoin_variance", "🎲 Вариация награды BTC"),
+    ],
+    "⚙️ Статы за уровень": [
+        ("stat_strength_per_level", "💪 Силы за уровень"),
+        ("stat_agility_per_level", "🏃 Ловкости за уровень"),
+        ("stat_defense_per_level", "🛡 Защиты за уровень"),
+    ],
+    "⚙️ Аукцион": [
+        ("auction_min_bid_step", "📈 Мин. шаг ставки"),
+        ("auction_commission", "💸 Комиссия аукциона (%)"),
+        ("auction_notify_chats", "📢 Уведомлять о торгах (1/0)"),
+    ],
+    "⚙️ Бой в чатах": [
+        ("fight_cooldown_minutes", "⏳ Кулдаун боя (минуты)"),
+        ("fight_base_damage", "💥 База урона"),
+        ("fight_damage_variance", "🎲 Вариация урона"),
+        ("fight_authority_min", "⬇️ Мин. авторитет за бой"),
+        ("fight_authority_max", "⬆️ Макс. авторитет за бой"),
+        ("fight_bitcoin_reward", "₿ BTC за бой"),
+    ],
+    "⚙️ Качалка (авторитет)": [
+        ("gym_strength_cost", "💪 Стоимость силы"),
+        ("gym_agility_cost", "🏃 Стоимость ловкости"),
+        ("gym_defense_cost", "🛡 Стоимость защиты"),
+    ],
+    "⚙️ Бизнесы": [
+        ("business_upgrade_cost_per_level", "📈 База стоимости улучшения"),
+    ],
+    "⚙️ Контрабанда": [
+        ("smuggle_min_duration", "⏳ Мин. длительность (минуты)"),
+        ("smuggle_max_duration", "⏳ Макс. длительность (минуты)"),
+        ("smuggle_success_chance", "✅ Шанс успеха (%)"),
+        ("smuggle_caught_chance", "🚨 Шанс попасться (%)"),
+        ("smuggle_lost_chance", "💥 Шанс потерять груз (%)"),
+        ("smuggle_base_amount", "₿ База BTC"),
+        ("smuggle_authority_multiplier", "⚔️ Множитель авторитета"),
+        ("smuggle_cooldown_minutes", "⏳ Базовый кулдаун (минуты)"),
+        ("smuggle_fail_penalty_minutes", "💔 Штраф при провале (минуты)"),
+    ],
+    "⚙️ Биткоины": [
+        ("bitcoin_per_theft", "🔫 BTC за кражу"),
+        ("bitcoin_per_fight", "⚔️ BTC за бой"),
+        ("bitcoin_per_casino_win", "🎰 BTC за победу в казино"),
+        ("bitcoin_per_slots_win", "🍒 BTC за победу в слотах"),
+        ("bitcoin_per_roulette_win", "🎡 BTC за победу в рулетке"),
+        ("bitcoin_per_dice_win", "🎲 BTC за победу в кости"),
+        ("bitcoin_per_guess_win", "🔢 BTC за победу в угадайке"),
+        ("bitcoin_per_boss_participation", "👾 BTC за участие в боссе"),
+    ],
+    "⚙️ Биткоин-биржа": [
+        ("exchange_min_price", "⬇️ Мин. цена BTC"),
+        ("exchange_max_price", "⬆️ Макс. цена BTC (0 - без лимита)"),
+        ("exchange_commission_percent", "💸 Комиссия биржи (%)"),
+        ("exchange_commission_side", "🔁 Сторона комиссии (buyer/seller/both)"),
+        ("exchange_commission_destination", "📍 Куда идет комиссия (burn/balance)"),
+        ("exchange_min_amount_btc", "⬇️ Мин. сумма заявки (BTC)"),
+    ],
+    "⚙️ Очистка логов": [
+        ("cleanup_days_fight_logs", "⚔️ Хранить логи боев (дней)"),
+        ("cleanup_days_bosses", "👾 Хранить боссов (дней)"),
+        ("cleanup_days_auctions", "🏷 Хранить аукционы (дней)"),
+        ("cleanup_days_purchases", "🛒 Хранить покупки (дней)"),
+        ("cleanup_days_giveaways", "🎁 Хранить розыгрыши (дней)"),
+        ("cleanup_days_user_tasks", "📋 Хранить задания (дней)"),
+        ("cleanup_days_smuggle", "📦 Хранить контрабанду (дней)"),
+        ("cleanup_days_bitcoin_orders", "₿ Хранить заявки (дней)"),
+    ],
+    "⚙️ Автоудаление": [
+        ("auto_delete_commands_seconds", "⏳ Автоудаление команд (секунд)"),
+    ],
+    "⚙️ Стартовый бонус": [
+        ("new_user_bonus", "🎁 Стартовый бонус"),
+    ],
+    "⚙️ Глобальный кулдаун": [
+        ("global_cooldown_seconds", "🌐 Глобальный кулдаун (секунд)"),
+    ],
+}
 
 # ==================== ГЛАВНОЕ МЕНЮ АДМИНКИ ====================
 @dp.message_handler(lambda message: message.text == "⚙️ Админ панель")
@@ -7456,10 +8948,6 @@ async def delete_boss_by_id_final(message: types.Message, state: FSMContext):
         await message.answer("Введи 'да' или 'нет'.")
 
 # ==================== УПРАВЛЕНИЕ АУКЦИОНАМИ (админские функции) ====================
-# (создание, просмотр активных, отмена)
-# Обратите внимание: пользовательские функции аукциона находятся в части 4,
-# здесь только админские.
-
 @dp.message_handler(lambda message: message.text == "➕ Создать аукцион")
 async def create_auction_start(message: types.Message):
     if not await check_admin_permissions(message.from_user.id, "manage_auctions"):
@@ -8237,10 +9725,82 @@ async def list_media(message: types.Message):
         text += f"• {row['key']}: {row['description']}\n"
     await message.answer(text, reply_markup=admin_media_keyboard())
 
-# ==================== НАСТРОЙКИ ИГРЫ ====================
-# Здесь должны быть обработчики для каждой категории настроек. Они уже были представлены ранее.
-# Я не буду повторять их здесь, чтобы не увеличивать объём. Они остаются без изменений.
-# (В оригинальном коде были подробные обработчики для каждой категории. При необходимости их можно добавить.)
+# ==================== НАСТРОЙКИ ИГРЫ (ПОЛНЫЙ ФУНКЦИОНАЛ) ====================
+
+@dp.message_handler(lambda message: message.text == "⚙️ Настройки")
+async def settings_menu(message: types.Message):
+    if not await check_admin_permissions(message.from_user.id, "edit_settings"):
+        await message.answer("❌ Недостаточно прав.")
+        return
+    await message.answer("Выбери категорию настроек:", reply_markup=settings_categories_keyboard())
+
+@dp.message_handler(lambda message: message.text in SETTINGS_CATEGORIES.keys())
+async def settings_category_handler(message: types.Message):
+    if not await check_admin_permissions(message.from_user.id, "edit_settings"):
+        await message.answer("❌ Недостаточно прав.")
+        return
+    
+    category = message.text
+    params = SETTINGS_CATEGORIES.get(category, [])
+    
+    # Получаем текущие значения
+    text = f"<b>{category}</b>\n\n"
+    kb_params = []
+    for key, desc in params:
+        value = await get_setting(key)
+        text += f"{desc}: <code>{value}</code>\n"
+        kb_params.append((key, desc))
+    
+    kb = settings_param_keyboard(kb_params, category)
+    await message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("settings_back_"))
+async def settings_back_callback(callback: types.CallbackQuery):
+    category = callback.data.split("_", 2)[2]  # settings_back_Категория
+    await callback.message.delete()
+    await settings_menu(callback.message)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("edit_"))
+async def edit_setting_start(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_admin_permissions(callback.from_user.id, "edit_settings"):
+        await callback.answer("❌ Недостаточно прав.", show_alert=True)
+        return
+    
+    key = callback.data[5:]  # убираем "edit_"
+    current_value = await get_setting(key)
+    
+    await state.update_data(key=key)
+    await callback.message.answer(
+        f"⚙️ Редактирование <b>{key}</b>\n"
+        f"Текущее значение: <code>{current_value}</code>\n\n"
+        f"Введи новое значение:",
+        reply_markup=back_keyboard()
+    )
+    await EditSettings.key.set()  # используем существующее состояние
+    await callback.answer()
+
+@dp.message_handler(state=EditSettings.key)
+async def edit_setting_value(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.finish()
+        await settings_menu(message)
+        return
+    
+    data = await state.get_data()
+    key = data['key']
+    new_value = message.text.strip()
+    
+    # Проверяем тип (можно добавить валидацию)
+    try:
+        await set_setting(key, new_value)
+        await message.answer(f"✅ Настройка <b>{key}</b> обновлена!\nНовое значение: <code>{new_value}</code>")
+    except Exception as e:
+        logging.error(f"Error setting {key}: {e}")
+        await message.answer("❌ Ошибка при сохранении настройки.")
+    
+    await state.finish()
+    await settings_menu(message)
 
 # ==================== СТАТИСТИКА ====================
 @dp.message_handler(lambda message: message.text == "📊 Статистика")
@@ -8407,14 +9967,15 @@ async def process_smuggle_runs():
             await asyncio.sleep(30)
             now = datetime.now()
             async with db_pool.acquire() as conn:
+                # Исправлено: передаем datetime объект
                 runs = await conn.fetch("""
                     SELECT * FROM smuggle_runs
-                    WHERE status = 'in_progress' AND end_time <= $1 AND notified = FALSE
-                """, now.strftime("%Y-%m-%d %H:%M:%S"))
+                    WHERE status = 'in_progress' AND end_time::timestamp <= $1 AND notified = FALSE
+                """, now)
 
                 for run in runs:
                     user_id = run['user_id']
-                    chat_id = run['chat_id']  # может быть None
+                    chat_id = run['chat_id']
 
                     rep = await get_user_reputation(user_id)
 
@@ -8489,15 +10050,12 @@ async def process_smuggle_runs():
                                 f"{result_text}\n(для {name})"
                             )
                         except:
-                            # Если не удалось отправить в чат, отправляем в личку
                             await safe_send_message(user_id, result_text)
                     else:
                         await safe_send_message(user_id, result_text)
 
-                    # Устанавливаем кулдаун
                     await set_smuggle_cooldown(user_id, penalty)
 
-                    # Начисляем опыт
                     exp = await get_setting_int("exp_per_smuggle")
                     await add_exp(user_id, exp, conn=conn)
 
@@ -8505,17 +10063,18 @@ async def process_smuggle_runs():
             logging.error(f"Error in process_smuggle_runs: {e}")
             await asyncio.sleep(60)
 
-# ==================== ФОНОВАЯ ЗАДАЧА: ПРОВЕРКА АУКЦИОНОВ ====================
+# ==================== ФОНОВАЯ ЗАДАЧА: ПРОВЕРКА АУКЦИОНОВ (ИСПРАВЛЕННАЯ) ====================
 async def check_auctions():
     while True:
         try:
             await asyncio.sleep(60)
             now = datetime.now()
             async with db_pool.acquire() as conn:
+                # Исправлено: явное приведение к timestamp
                 expired = await conn.fetch("""
                     SELECT * FROM auctions
-                    WHERE status = 'active' AND end_time IS NOT NULL AND end_time <= $1
-                """, now.strftime("%Y-%m-%d %H:%M:%S"))
+                    WHERE status = 'active' AND end_time IS NOT NULL AND end_time::timestamp <= $1
+                """, now)
 
                 for auction in expired:
                     auction_id = auction['id']
@@ -8601,7 +10160,6 @@ async def boss_spawn_scheduler():
                         except:
                             pass
 
-                # Проверяем, нет ли уже активного босса в этом чате
                 existing = await conn2.fetchval(
                     "SELECT 1 FROM bosses WHERE chat_id = $1 AND status = 'active'",
                     chat_id
@@ -8635,10 +10193,10 @@ async def ad_sender():
                     interval = ad['interval_minutes']
                     if last_sent:
                         try:
-                            try:
-                                last = datetime.strptime(str(last_sent), "%Y-%m-%d %H:%M:%S.%f")
-                            except:
-                                last = datetime.strptime(str(last_sent), "%Y-%m-%d %H:%M:%S")
+                            if isinstance(last_sent, str):
+                                last = datetime.strptime(last_sent, "%Y-%m-%d %H:%M:%S.%f")
+                            else:
+                                last = last_sent
                             if (now - last).total_seconds() < interval * 60:
                                 continue
                         except:
@@ -8696,7 +10254,6 @@ async def update_all_businesses_income():
         await asyncio.sleep(3600)  # 1 час
         try:
             async with db_pool.acquire() as conn:
-                # Получаем все бизнесы с их типом
                 businesses = await conn.fetch("""
                     SELECT ub.*, bt.base_income_cents 
                     FROM user_businesses ub
@@ -8715,7 +10272,7 @@ async def update_all_businesses_income():
 
 # ==================== ЗАПУСК БОТА ====================
 async def on_startup(dp):
-    # Устанавливаем команды бота (только для личных сообщений)
+    # Устанавливаем команды бота
     await bot.set_my_commands([
         types.BotCommand("start", "🚀 Запустить бота"),
         types.BotCommand("help", "📚 Помощь и команды"),
@@ -8731,7 +10288,8 @@ async def on_startup(dp):
         types.BotCommand("auction", "🏷 Аукцион"),
         types.BotCommand("business", "🏪 Мои бизнесы"),
         types.BotCommand("exchange", "💼 Биткоин-биржа"),
-        types.BotCommand("cancel", "❌ Отменить действие")
+        types.BotCommand("cancel", "❌ Отменить действие"),
+        types.BotCommand("activate_chat", "🔔 Активировать чат")
     ])
     logging.info("Бот запущен!")
 
