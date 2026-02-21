@@ -4230,6 +4230,32 @@ async def process_roulette_repeat(user_id: int, amount: float, bet_type: str, nu
             await update_user_balance(user_id, profit, conn=conn)
             exp = await get_setting_int("exp_per_roulette_win")
             btc_reward = await get_setting_int("bitcoin_per_roulette_win")
+            if btc_reward:
+                await update_user_bitcoin(user_id, float(btc_reward), conn=conn)
+            phrase = get_random_phrase(ROULETTE_WIN_PHRASES, number=num, color=color, profit=profit)
+        else:
+            exp = await get_setting_int("exp_per_roulette_lose")
+            phrase = get_random_phrase(ROULETTE_LOSE_PHRASES, number=num, color=color, loss=amount)
+        await add_exp(user_id, exp, conn=conn)
+
+    bet_data = {'bet_type': bet_type, 'number': number} if win else None
+    await save_last_bet(user_id, 'roulette', amount, bet_data)
+    await message.answer(phrase, reply_markup=repeat_bet_keyboard('roulette'))
+
+    async with db_pool.acquire() as conn:
+        await update_user_balance(user_id, -amount, conn=conn)
+        await update_user_game_stats(user_id, 'roulette', win, conn=conn)
+        if win:
+            if bet_type == 'number':
+                multiplier = await get_setting_float("roulette_number_multiplier")
+            elif bet_type == 'green':
+                multiplier = await get_setting_float("roulette_green_multiplier")
+            else:
+                multiplier = await get_setting_float("roulette_color_multiplier")
+            profit = amount * multiplier
+            await update_user_balance(user_id, profit, conn=conn)
+            exp = await get_setting_int("exp_per_roulette_win")
+            btc_reward = await get_setting_int("bitcoin_per_roulette_win")
             if btc_reward > 0:
                 await update_user_bitcoin(user_id, float(btc_reward), conn=conn)
             phrase = get_random_phrase(ROULETTE_WIN_PHRASES, number=num, color=color, profit=profit)
